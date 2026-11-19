@@ -240,9 +240,8 @@ export function prsFor(w, workouts) {
 }
 
 export function weekCount(workouts, now = new Date()) {
-  const d = new Date(now); const dow = (d.getDay() + 6) % 7; // Monday = 0
-  d.setHours(0, 0, 0, 0); d.setDate(d.getDate() - dow);
-  return workouts.filter((w) => new Date(w.start) >= d).length;
+  const from = mondayOf(now), to = from + 7 * DAY;
+  return workouts.filter((w) => { const t = new Date(w.start).getTime(); return t >= from && t < to; }).length;
 }
 
 // Consecutive Mon–Sun weeks (ending this week or last) with ≥3 workouts.
@@ -254,6 +253,101 @@ export function streak(workouts, now = new Date()) {
   if ((counts.get(k) || 0) < 3) k -= 7 * DAY; // current week may still be in progress
   while ((counts.get(k) || 0) >= 3) { n++; k -= 7 * DAY; }
   return n;
+}
+
+// ---------- ramp-up ----------
+// phase.ramp = { sessions, sets }: for the first `sessions` workouts of the phase, cap sets per exercise.
+export function rampInfo(phase, done) {
+  const r = phase && phase.ramp;
+  if (!r || done >= r.sessions) return null;
+  return { sets: r.sets, left: r.sessions - done, of: r.sessions };
+}
+export function applyRamp(items, ramp) {
+  if (!ramp) return items;
+  return items.map((it) => ({ ...it, sets: Math.min(it.sets, ramp.sets) }));
+}
+
+// ---------- muscle balance ----------
+// Each completed work set counts 1 toward every primary muscle and 0.5 toward every secondary.
+const GUESS = [
+  [/hamstring|leg curl|romanian|rdl|deadlift|good morning/i, ['hams'], ['glutes']],
+  [/calf|tibialis/i, ['calves'], []],
+  [/squat|lunge|step up|split/i, ['quads', 'glutes'], []],
+  [/glute|bridge|thrust|abduct/i, ['glutes'], ['hams']],
+  [/back extension|hyperextension|superman/i, ['lowback'], ['glutes']],
+  [/face pull|reverse fly|rear delt|y-t-w/i, ['rear'], ['back']],
+  [/overhead press|shoulder press|military|arnold/i, ['delts'], ['triceps']],
+  [/lateral raise|front raise|upright/i, ['delts'], []],
+  [/tricep|skull|kickback|pushdown|dip/i, ['triceps'], []],
+  [/curl/i, ['biceps'], []],
+  [/row|pull ?up|chin|pulldown|pull-up/i, ['back'], ['biceps']],
+  [/shrug/i, ['back'], []],
+  [/bench|press|push ?up|fly/i, ['chest'], ['triceps', 'delts']],
+  [/plank|crunch|leg raise|dead bug|twist|elbow to knee|shoulder tap|slam|ab |core/i, ['core'], []],
+  [/farmer|carry|walk/i, ['core'], ['back']],
+];
+export function musclesOf(ex) {
+  if (ex && (ex.prim || ex.sec)) return { prim: ex.prim || [], sec: ex.sec || [] };
+  const n = (ex && ex.name) || '';
+  for (const [re, prim, sec] of GUESS) if (re.test(n)) return { prim, sec };
+  return { prim: [], sec: [] };
+}
+
+export function mondayOf(t) {
+  const d = new Date(t); d.setHours(0, 0, 0, 0); d.setDate(d.getDate() - ((d.getDay() + 6) % 7));
+  return d.getTime();
+}
+
+export function muscleSets(workouts, getEx, from, to = Infinity) {
+  const out = {};
+  for (const w of workouts) {
+    const t = new Date(w.start).getTime();
+    if (t < from || t >= to) continue;
+    for (const en of w.exercises) {
+      const n = workSets(en).length;
+      if (!n) continue;
+      const m = musclesOf(getEx(en.exId));
+      for (const k of m.prim) out[k] = (out[k] || 0) + n;
+      for (const k of m.sec) out[k] = (out[k] || 0) + n * 0.5;
+    }
+  }
+  return out;
+}
+
+// No hard targets: a muscle group is flagged only when it's far behind the rest over the last 3 weeks.
+// Low back is never flagged (it's injury-prone and gets indirect work already).
+export function balance(workouts, getEx, groups, now = Date.now()) {
+  const mon = mondayOf(now);
+  const weeks = [3, 2, 1, 0].map((k) => {
+    const from = mon - k * 7 * DAY;
+    return { from, sets: muscleSets(workouts, getEx, from, from + 7 * DAY), n: workouts.filter((w) => { const t = new Date(w.start).getTime(); return t >= from && t < from + 7 * DAY; }).length };
+  });
+  const since = now - 21 * DAY;
+  const recent = muscleSets(workouts, getEx, since);
+  const nRecent = workouts.filter((w) => new Date(w.start).getTime() >= since).length;
+  const vals = groups.map((g) => recent[g] || 0).sort((a, b) => a - b);
+  const med = vals.length ? (vals[Math.floor((vals.length - 1) / 2)] + vals[Math.ceil((vals.length - 1) / 2)]) / 2 : 0;
+  const flagged = [];
+  if (nRecent >= 3) {
+    for (const g of groups) {
+      if (g === 'lowback') continue;
+      const v = recent[g] || 0;
+      if (v === 0) flagged.push({ g, v, why: 'nothing in 3 weeks' });
+      else if (v < 0.35 * med) flagged.push({ g, v, why: `only ${fmt(v)} sets in 3 weeks` });
+    }
+  }
+  return { week: weeks[3].sets, weeks, recent, nRecent, flagged, med };
+}
+
+// ---------- bodyweight ----------
+// entries: [{ date: 'YYYY-MM-DD', lb }]. Trend = trailing 7-day average.
+export function bwTrend(entries) {
+  const list = [...(entries || [])].sort((a, b) => (a.date < b.date ? -1 : 1));
+  return list.map((e, i) => {
+    const t = new Date(`${e.date}T12:00:00`).getTime();
+    const win = list.slice(0, i + 1).filter((x) => t - new Date(`${x.date}T12:00:00`).getTime() < 7 * DAY);
+    return { ...e, t, avg: win.reduce((a, x) => a + x.lb, 0) / win.length };
+  });
 }
 
 export function formatSet(s, kind, perSide) {

@@ -1,11 +1,12 @@
 // Beam Lift — UI. Vanilla JS, hash routes, one delegated click handler (data-act).
 import * as DB from './db.js';
-import { APP_VERSION, DEFAULT_PROGRAM, DEFAULT_SETTINGS, EXERCISES, KIND_LABEL } from './data.js';
+import { APP_VERSION, DEFAULT_PROGRAM, DEFAULT_SETTINGS, EXERCISES, KIND_LABEL, MUSCLES } from './data.js';
 import * as E from './engine.js';
-import { readHevy, convertHevy } from './hevy.js';
+import { readHevy, convertHevy, mapName } from './hevy.js';
 import { buildBackup, buildCSV, shareOrDownload } from './io.js';
 
-const S = { settings: null, program: null, state: null, coach: {}, custom: {}, workouts: [], active: null };
+const S = { settings: null, program: null, state: null, coach: {}, custom: {}, workouts: [], active: null, bw: [] };
+const GROUPS = Object.keys(MUSCLES);
 const UI = { pickDay: null, worse: { knee: false, shoulder: false, back: false }, short: false, edit: null, ci: null, hevy: null, json: null };
 
 const view = document.getElementById('view');
@@ -28,6 +29,8 @@ const howUrl = (ex) => `https://www.youtube.com/results?search_query=${encodeURI
 const gifUrl = (ex) => `https://www.google.com/search?tbm=isch&q=${encodeURIComponent(`${ex.name} exercise gif`)}`;
 const buzz = (p) => { try { navigator.vibrate && navigator.vibrate(p); } catch { /* no vibration */ } };
 const restFor = (exId, itemRest) => (S.settings.restOverrides || {})[exId] || itemRest || S.settings.restDefault;
+const localDate = (d = new Date()) => new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 10);
+const byDate = (a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0);
 
 function wLabel(kind, w) {
   if (!E.isWeighted(kind)) return kind === 'bw' && w ? `+${fmt(w)} lb` : 'bodyweight';
@@ -71,7 +74,32 @@ async function load() {
   S.coach = (await DB.get('coach')) || {};
   S.custom = (await DB.get('custom')) || {};
   S.active = (await DB.get('active')) || null;
+  S.bw = ((await DB.get('bodyweight')) || []).sort(byDate);
   S.workouts = ((await DB.allWorkouts()) || []).sort(byStart);
+  await migrate();
+}
+// Hevy exercises that were custom (h-…) but now exist in the catalog get relinked, so history and
+// progression carry over (e.g. "TRX Hamstring Curl" → trx-ham-curl).
+async function migrate() {
+  const changed = [];
+  for (const w of S.workouts) {
+    let dirty = false;
+    for (const en of w.exercises) {
+      if (!en.hevyName || EXERCISES[en.exId]) continue;
+      const id = mapName(en.hevyName);
+      if (!id) continue;
+      const ex = EXERCISES[id];
+      Object.assign(en, { exId: id, name: ex.name, kind: ex.kind, perSide: !!ex.perSide });
+      dirty = true;
+    }
+    if (dirty) changed.push(w);
+  }
+  if (changed.length) await DB.putWorkouts(changed);
+  let c = false;
+  for (const [id, ex] of Object.entries(S.custom)) {
+    if (ex.custom && (ex.hevy || []).some((n) => mapName(n))) { delete S.custom[id]; c = true; }
+  }
+  if (c) await DB.set('custom', S.custom);
 }
 const saveActive = () => (S.active ? DB.set('active', S.active) : DB.del('active'));
 const saveSettings = () => DB.set('settings', S.settings);
@@ -156,7 +184,7 @@ function route() {
   const i = h.indexOf('/');
   return i < 0 ? { name: h, arg: null } : { name: h.slice(0, i), arg: decodeURIComponent(h.slice(i + 1)) };
 }
-const TAB = { today: 'today', workout: 'today', summary: 'today', history: 'history', w: 'history', progress: 'progress', ex: 'progress', settings: 'settings', import: 'settings' };
+const TAB = { today: 'today', workout: 'today', summary: 'today', history: 'history', w: 'history', progress: 'progress', ex: 'progress', balance: 'progress', bw: 'progress', settings: 'settings', import: 'settings' };
 const VIEWS = {};
 function render() {
   const r = route();
@@ -216,7 +244,9 @@ function makeEntry(it, c) {
 function defaultItem(id) {
   const found = E.findItem(S.program, id, S.state.phase);
   if (found) return { ...found };
-  const k = getEx(id).kind;
+  const ex = getEx(id);
+  if (ex.rx) return { ex: id, sets: ex.rx[0], reps: [ex.rx[1], ex.rx[2]], start: ex.start, rest: ex.rest };
+  const k = ex.kind;
   return { ex: id, sets: 2, reps: k === 'time' ? [20, 30] : k === 'carry' ? [30, 30] : [8, 12] };
 }
 function currentIdx() {
@@ -226,8 +256,8 @@ function currentIdx() {
 function exercisePicker(act, i) {
   const known = Object.entries(EXERCISES).map(([id, ex]) => ({ id, name: ex.name }));
   const custom = Object.entries(S.custom).map(([id, ex]) => ({ id, name: ex.name }));
-  const btn = (e) => `<button class="li-btn" data-act="${act}" data-i="${i ?? ''}" data-v="${esc(e.id)}">${esc(e.name)}</button>`;
-  return `<div class="picker">${known.sort((a, b) => a.name.localeCompare(b.name)).map(btn).join('')}
+  const btn = (e) => `<button class="li-btn" data-act="${act}" data-i="${i ?? ''}" data-v="${esc(e.id)}" data-name="${esc(e.name.toLowerCase())}">${esc(e.name)}</button>`;
+  return `<input class="search" id="pick-filter" placeholder="Search exercises…" autocomplete="off"><div class="picker">${known.sort((a, b) => a.name.localeCompare(b.name)).map(btn).join('')}
     ${custom.length ? `<div class="q">From your Hevy history</div>${custom.sort((a, b) => a.name.localeCompare(b.name)).map(btn).join('')}` : ''}</div>`;
 }
 
@@ -238,14 +268,19 @@ VIEWS.today = () => {
   const dayKey = UI.pickDay && phase.days[UI.pickDay] ? UI.pickDay : nd.day;
   const day = phase.days[dayKey];
   const c = ctx({ worse: UI.worse });
-  const items = shortItems(day.items, UI.short);
+  const ramp = E.rampInfo(phase, nd.done);
+  const items = E.applyRamp(shortItems(day.items, UI.short), ramp);
   const wk = E.weekCount(S.workouts), stk = E.streak(S.workouts);
   const nextPhase = S.program.phases[S.program.phases.indexOf(phase) + 1];
   const hadOwn = S.workouts.some((w) => w.source !== 'hevy');
+  const lastBw = S.bw[S.bw.length - 1];
+  const weighIn = !lastBw || Date.now() - new Date(`${lastBw.date}T12:00:00`) > 7 * E.DAY;
   let h = `<div class="today-head">
     <div><div class="muted">${dateStr(new Date())}</div><h1>${esc(day.name)}</h1>
-    <div class="muted small">${esc(phase.name)} · session ${Math.min(nd.done + 1, phase.sessions)} of ${phase.sessions}</div></div>
-    <div class="week"><b>${wk}/3</b><span>this week</span>${stk ? `<span>🔥 ${stk} wk streak</span>` : ''}</div></div>`;
+    <div class="muted small">${esc(phase.name)} · session ${Math.min(nd.done + 1, phase.sessions)} of ${phase.sessions}</div>
+    ${ramp ? `<div class="ramp small">Ramp-up: up to ${ramp.sets} sets per exercise · ${ramp.left} session${ramp.left === 1 ? '' : 's'} left</div>` : ''}</div>
+    <div class="week"><b>${wk}/3</b><span>this week</span>${stk ? `<span>🔥 ${stk} wk streak</span>` : ''}
+    ${weighIn ? '<button class="linkbtn small" data-act="bwLog">⚖ Weigh in</button>' : ''}</div></div>`;
   if (nd.done >= phase.sessions && nextPhase) {
     h += `<div class="banner">${esc(phase.name)} complete. <button class="btn small primary" data-act="setPhase" data-v="${esc(nextPhase.id)}">Start ${esc(nextPhase.name)}</button></div>`;
   }
@@ -268,9 +303,92 @@ VIEWS.today = () => {
       <div class="note ${s.decision}">${esc(s.note)}</div></div>
       <a class="icon" href="${esc(howUrl(ex))}" target="_blank" rel="noopener" aria-label="How-to video">▶</a></div>`;
   }).join('')}</div>`;
+  h += balanceCard();
   if (!S.active) h += `<div class="cta"><button class="btn primary big" data-act="start" data-v="${esc(dayKey)}">Start ${esc(day.name)}</button></div>`;
   return h;
 };
+
+// ---------- muscle balance ----------
+function muscleBars(sets, flagged = []) {
+  const max = Math.max(1, ...GROUPS.map((g) => sets[g] || 0));
+  return `<div class="mbars">${GROUPS.map((g) => {
+    const v = sets[g] || 0;
+    return `<div class="mb ${flagged.some((f) => f.g === g) ? 'lag' : ''}"><span>${MUSCLES[g]}</span><i style="--w:${Math.round((100 * v) / max)}%"></i><b>${v ? fmt(v) : '·'}</b></div>`;
+  }).join('')}</div>`;
+}
+function flagLine(b) {
+  if (b.flagged.length) return `<div class="note hold">Falling behind: ${esc(b.flagged.map((f) => `${MUSCLES[f.g]} (${f.why})`).join(' · '))}</div>`;
+  return b.nRecent >= 3 ? '<div class="note progress">Nothing is far behind over the last 3 weeks.</div>' : '<div class="muted small">Flags start after 3 workouts in 3 weeks.</div>';
+}
+function balanceCard() {
+  const b = E.balance(S.workouts, getEx, GROUPS);
+  return `<a class="card link" href="#balance"><div class="row"><div class="q">This week · sets per muscle</div><span class="muted small">4 weeks ›</span></div>
+    ${flagLine(b)}${muscleBars(b.week, b.flagged)}</a>`;
+}
+
+VIEWS.balance = () => {
+  const b = E.balance(S.workouts, getEx, GROUPS);
+  const max = Math.max(1, ...b.weeks.flatMap((w) => GROUPS.map((g) => w.sets[g] || 0)));
+  const head = b.weeks.map((w, i) => `<th>${i === 3 ? 'This wk' : esc(dateStr(w.from, { month: 'short', day: 'numeric' }))}</th>`).join('');
+  const rows = GROUPS.map((g) => `<tr class="${b.flagged.some((f) => f.g === g) ? 'lag' : ''}"><td>${MUSCLES[g]}</td>${b.weeks.map((w) => {
+    const v = w.sets[g] || 0;
+    return `<td><span class="heat" style="--a:${(0.1 + (0.75 * v) / max).toFixed(2)}">${v ? fmt(v) : '·'}</span></td>`;
+  }).join('')}</tr>`).join('');
+  return `<button class="back linkbtn" data-act="goBack">‹ Back</button><h1>Muscle balance</h1>
+    <div class="muted small">Hard sets per muscle group, Monday–Sunday. Main muscle = 1, helper muscle = ½. No quotas: a flag only means a group is far behind the rest over 3 weeks.</div>
+    <div class="card">${flagLine(b)}<table class="heatmap"><thead><tr><th></th>${head}</tr></thead><tbody>${rows}
+    <tr class="wk"><td>Workouts</td>${b.weeks.map((w) => `<td>${w.n}</td>`).join('')}</tr></tbody></table></div>`;
+};
+
+// ---------- bodyweight ----------
+function bwChart(tr, goal) {
+  if (tr.length < 2) return '<div class="muted small">Chart appears after 2 weigh-ins.</div>';
+  const W = 340, H = 170, P = { l: 36, r: 10, t: 14, b: 22 };
+  const x0 = tr[0].t, x1 = tr[tr.length - 1].t;
+  const ys = tr.map((p) => p.lb).concat(goal ? goal : []);
+  let y0 = Math.min(...ys), y1 = Math.max(...ys);
+  const pad = (y1 - y0) * 0.1 || 2; y0 -= pad; y1 += pad;
+  const X = (t) => P.l + ((t - x0) / (x1 - x0 || 1)) * (W - P.l - P.r);
+  const Y = (v) => H - P.b - ((v - y0) / (y1 - y0 || 1)) * (H - P.t - P.b);
+  const band = goal ? `<rect x="${P.l}" width="${W - P.l - P.r}" y="${Y(goal[1]).toFixed(1)}" height="${Math.max(2, Y(goal[0]) - Y(goal[1])).toFixed(1)}" class="goal"/><text x="${W - P.r - 4}" y="${(Y(goal[1]) + 12).toFixed(1)}" text-anchor="end" class="goal-t">goal</text>` : '';
+  const d = tr.map((p, i) => `${i ? 'L' : 'M'}${X(p.t).toFixed(1)},${Y(p.avg).toFixed(1)}`).join('');
+  const dots = tr.map((p) => `<circle cx="${X(p.t).toFixed(1)}" cy="${Y(p.lb).toFixed(1)}" r="2.5" class="raw"/>`).join('');
+  const ticks = [y0 + pad, (y0 + y1) / 2, y1 - pad].map((v) => `<line x1="${P.l}" x2="${W - P.r}" y1="${Y(v)}" y2="${Y(v)}" class="grid"/><text x="${P.l - 6}" y="${Y(v) + 4}" text-anchor="end">${Math.round(v)}</text>`).join('');
+  const dl = (t) => new Date(t).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+  return `<svg class="chart" viewBox="0 0 ${W} ${H}" role="img" aria-label="Bodyweight over time">${band}${ticks}<path d="${d}" class="line"/>${dots}
+    <text x="${P.l}" y="${H - 4}">${dl(x0)}</text><text x="${W - P.r}" y="${H - 4}" text-anchor="end">${dl(x1)}</text></svg>
+    <div class="muted small">Dots = weigh-ins · line = 7-day average${goal ? ' · band = your goal' : ''}</div>`;
+}
+function bwSummary(tr) {
+  const last = tr[tr.length - 1];
+  if (!last) return '';
+  const old = tr.find((x) => last.t - x.t <= 30 * E.DAY);
+  const ch = old && old !== last ? last.avg - old.avg : null;
+  return `<div class="bw-now"><b>${fmt(last.lb)}</b> lb <span class="muted small">· 7-day avg ${fmt(last.avg)}${ch != null ? ` · ${ch >= 0 ? '+' : ''}${fmt(ch)} lb since ${esc(dateStr(old.t, { month: 'short', day: 'numeric' }))}` : ''}</span></div>`;
+}
+function bwCard() {
+  const tr = E.bwTrend(S.bw);
+  return `<div class="card"><div class="row"><div class="q">Bodyweight</div><button class="btn small" data-act="bwLog">+ Log</button></div>
+    ${tr.length ? `${bwSummary(tr)}${bwChart(tr, S.settings.bwGoal)}` : '<div class="muted small">Weigh in now and then — same time of day is best. The trend line smooths out daily swings.</div>'}
+    <a class="small" href="#bw">History & goal ›</a></div>`;
+}
+VIEWS.bw = () => {
+  const tr = E.bwTrend(S.bw);
+  const g = S.settings.bwGoal || ['', ''];
+  return `<button class="back linkbtn" data-act="goBack">‹ Back</button><h1>Bodyweight</h1>
+    <div class="card">${bwSummary(tr)}${bwChart(tr, S.settings.bwGoal)}<button class="btn primary wide" data-act="bwLog">+ Log weight</button></div>
+    <div class="card"><div class="q">Goal range (lb)</div><div class="inline"><input id="bwg0" inputmode="decimal" value="${esc(g[0])}" placeholder="from"><input id="bwg1" inputmode="decimal" value="${esc(g[1])}" placeholder="to"><button class="btn small" data-act="bwGoal">Save</button></div></div>
+    ${[...tr].reverse().map((e) => `<div class="card li"><div class="grow"><b>${fmt(e.lb)} lb</b><div class="muted small">${esc(dateStr(e.t, { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' }))} · avg ${fmt(e.avg)}</div></div><button class="icon" data-act="bwDel" data-v="${esc(e.date)}" aria-label="Delete weigh-in">✕</button></div>`).join('')}`;
+};
+function openBwLog() {
+  const last = S.bw[S.bw.length - 1];
+  openSheet(`<h3>Log bodyweight</h3><div class="muted">lb</div>
+    <div class="stepper"><button class="step" data-act="bwStep" data-d="-0.5" aria-label="Decrease">−</button>
+    <input id="bwv" type="number" inputmode="decimal" step="0.1" value="${esc(last ? last.lb : '')}">
+    <button class="step" data-act="bwStep" data-d="0.5" aria-label="Increase">+</button></div>
+    <label class="fld">Date<input id="bwd" type="date" value="${localDate()}"></label>
+    <button class="btn primary big" data-act="bwSave">Save</button>`);
+}
 
 VIEWS.workout = () => {
   const w = S.active;
@@ -343,9 +461,18 @@ VIEWS.summary = (id) => {
     return `<div class="li"><div class="grow"><b>${esc(en.name)}</b><div class="muted small">${E.workSets(en).map((x) => E.formatSet(x, en.kind, en.perSide)).join(' · ') || 'stopped'}</div>
       <div class="note ${s.decision}">Next time: ${esc(nextText(ex.kind, s))}. ${esc(s.note)}</div></div></div>`;
   }).join('');
+  const mon = E.mondayOf(w.start);
+  const inWeek = S.workouts.filter((x) => E.mondayOf(x.start) === mon);
+  let recap = '';
+  if (inWeek.length >= 3) {
+    const b = E.balance(S.workouts, getEx, GROUPS, new Date(w.start).getTime());
+    const wkSets = inWeek.reduce((a, x) => a + x.exercises.reduce((s, en) => s + E.workSets(en).length, 0), 0);
+    recap = `<div class="card"><div class="q">📅 Week recap · ${inWeek.length} workouts · ${wkSets} sets</div>${flagLine(b)}${muscleBars(E.muscleSets(inWeek, getEx, mon, mon + 7 * E.DAY), b.flagged)}</div>`;
+  }
   return `<h1>Workout done 💪</h1>
     <div class="tiles"><div class="tile"><b>${mins ?? '–'}</b><span>min</span></div><div class="tile"><b>${sets}</b><span>sets</span></div><div class="tile"><b>${E.workoutVolume(w).toLocaleString()}</b><span>lb volume</span></div></div>
     ${prs.length ? `<div class="card"><div class="q">🏆 Personal records</div>${prs.map((p) => `<div class="pr"><b>${esc(p.ex)}</b> — ${esc(p.what)} ${esc(p.val)}</div>`).join('')}</div>` : ''}
+    ${recap}
     <div class="card list">${next}</div>
     <button class="btn ghost wide" data-act="exportJSON">Back up now (JSON)</button>
     <a class="btn primary big" href="#today">Done</a>`;
@@ -382,7 +509,8 @@ VIEWS.w = (id) => {
 VIEWS.progress = () => {
   const last = new Map();
   for (const w of S.workouts) for (const en of w.exercises) if (E.workSets(en).length) last.set(en.exId, w.start);
-  if (!last.size) return '<h1>Progress</h1><div class="card empty">Log a workout or import Hevy history to see progress.</div>';
+  const top = `${bwCard()}<a class="card li link" href="#balance"><div class="grow"><b>Muscle balance</b><div class="muted small">Sets per muscle group, last 4 weeks</div></div><span class="metric">›</span></a>`;
+  if (!last.size) return `<h1>Progress</h1>${top}<div class="card empty">Log a workout or import Hevy history to see lift progress.</div>`;
   const rows = [...last.entries()].sort((a, b) => (a[1] < b[1] ? 1 : -1)).map(([id, when]) => {
     const ex = getEx(id);
     const pts = E.series(id, S.workouts);
@@ -391,7 +519,7 @@ VIEWS.progress = () => {
     return `<a class="card li link" data-name="${esc(ex.name.toLowerCase())}" href="#ex/${encodeURIComponent(id)}"><div class="grow"><b>${esc(ex.name)}</b>
       <div class="muted small">${pts.length} sessions · last ${dateStr(when, { month: 'short', day: 'numeric', year: '2-digit' })}</div></div><span class="metric">${metric}</span></a>`;
   }).join('');
-  return `<h1>Progress</h1><input class="search" id="ex-filter" placeholder="Filter exercises…" autocomplete="off">${rows}`;
+  return `<h1>Progress</h1>${top}<div class="q">Lifts</div><input class="search" id="ex-filter" placeholder="Filter exercises…" autocomplete="off">${rows}`;
 };
 
 VIEWS.ex = (id) => {
@@ -444,7 +572,7 @@ VIEWS.settings = () => {
   <div class="card"><div class="q">Your data</div>
     <div class="row-btns"><button class="btn" data-act="exportJSON">Export backup (JSON)</button><button class="btn" data-act="exportCSV">Export CSV</button></div>
     <button class="btn ghost wide" data-act="importFile">Import: Hevy CSV or Beam Lift JSON</button>
-    <div class="muted small">${S.workouts.length} workouts stored on this phone. Back up after workouts until cloud sync lands (v1.1).</div></div>
+    <div class="muted small">${S.workouts.length} workouts stored on this phone. Back up after workouts until cloud sync lands.</div></div>
   <div class="card"><div class="q">Program phase</div><div class="chips">${S.program.phases.map((p) => `<button class="chip ${p.id === S.state.phase ? 'on' : ''}" data-act="setPhase" data-v="${esc(p.id)}">${esc(p.name)}</button>`).join('')}</div>
     ${coach.length ? `<div class="q">Coach targets (used once, next time)</div>${coach.map(([id, t]) => `<div class="li"><div class="grow">${esc(getEx(id).name)}: ${esc(wLabel(getEx(id).kind, t.weight))}${t.reps ? ` × ${t.reps}` : ''}</div><button class="btn small ghost" data-act="clearCoach" data-v="${esc(id)}">Clear</button></div>`).join('')}` : ''}
     <details><summary>Edit program (JSON)</summary><textarea id="progjson" spellcheck="false">${esc(JSON.stringify(S.program, null, 2))}</textarea>
@@ -478,14 +606,16 @@ VIEWS.import = () => {
 // ---------- actions ----------
 async function startWorkout(dayKey) {
   askNotify(); unlockAudio();
-  const phase = E.currentPhase(S.program, S.state);
+  const nd = E.nextDay(S.program, S.state, S.workouts);
+  const phase = nd.phase;
   const day = phase.days[dayKey];
+  const ramp = E.rampInfo(phase, nd.done);
   const now = new Date();
   const c = ctx({ worse: UI.worse });
   S.active = {
     id: `w-${now.toISOString()}`, title: day.name, phase: phase.id, day: dayKey, source: 'beamlift',
-    start: now.toISOString(), end: null, short: UI.short, checkin: { worse: { ...UI.worse } }, rest: null,
-    exercises: shortItems(day.items, UI.short).map((it) => makeEntry(it, c)),
+    start: now.toISOString(), end: null, short: UI.short, ramp: !!ramp, checkin: { worse: { ...UI.worse } }, rest: null,
+    exercises: E.applyRamp(shortItems(day.items, UI.short), ramp).map((it) => makeEntry(it, c)),
   };
   UI.pickDay = null; UI.worse = { knee: false, shoulder: false, back: false }; UI.short = false;
   await saveActive();
@@ -588,6 +718,33 @@ const STOP_REASONS = ['Knee gave way / caught', 'Shoulder slipped', 'Sharp or ra
 
 const A = {
   closeSheet,
+  goBack: () => { if (history.length > 1) history.back(); else location.hash = '#today'; },
+  bwLog: openBwLog,
+  bwStep: (el) => {
+    const inp = document.getElementById('bwv');
+    const v = parseFloat(inp.value);
+    inp.value = fmt(Math.max(0, (isNaN(v) ? 150 : v) + +el.dataset.d));
+  },
+  bwSave: async () => {
+    const lb = parseFloat(document.getElementById('bwv').value);
+    const date = document.getElementById('bwd').value || localDate();
+    if (!(lb > 50 && lb < 500)) { toast('Enter your weight in lb'); return; }
+    S.bw = [...S.bw.filter((e) => e.date !== date), { date, lb }].sort(byDate);
+    await DB.set('bodyweight', S.bw);
+    closeSheet(); toast(`Logged ${fmt(lb)} lb`); render();
+  },
+  bwDel: async (el) => {
+    if (!confirm('Delete this weigh-in?')) return;
+    S.bw = S.bw.filter((e) => e.date !== el.dataset.v);
+    await DB.set('bodyweight', S.bw); render();
+  },
+  bwGoal: async () => {
+    const a = parseFloat(document.getElementById('bwg0').value), b = parseFloat(document.getElementById('bwg1').value);
+    if (isNaN(a) && isNaN(b)) S.settings.bwGoal = null;
+    else if (a > 50 && b >= a && b < 500) S.settings.bwGoal = [a, b];
+    else { toast('Goal needs two numbers, low then high'); return; }
+    await saveSettings(); toast('Goal saved'); render();
+  },
   resume: () => { location.hash = '#workout'; },
   pickDay: (el) => { UI.pickDay = el.dataset.v; render(); },
   worse: (el) => { UI.worse[el.dataset.v] = !UI.worse[el.dataset.v]; render(); },
@@ -768,6 +925,11 @@ const A = {
     if (o.program && Array.isArray(o.program.phases)) { S.program = o.program; await DB.set('program', S.program); }
     if (o.settings) { S.settings = { ...S.settings, ...o.settings }; await saveSettings(); }
     if (o.state) { S.state = { ...S.state, ...o.state }; await DB.set('state', S.state); }
+    if (Array.isArray(o.bodyweight)) {
+      const m = new Map(S.bw.map((e) => [e.date, e]));
+      for (const e of o.bodyweight) if (e && e.date && e.lb > 0) m.set(e.date, { date: e.date, lb: +e.lb });
+      S.bw = [...m.values()].sort(byDate); await DB.set('bodyweight', S.bw);
+    }
     UI.json = null; closeSheet();
     toast('Imported');
     if (o.hevyCsv) { UI.hevy = readHevy(o.hevyCsv); location.hash = '#import'; render(); } else { location.hash = '#history'; }
@@ -822,9 +984,10 @@ document.addEventListener('change', (e) => {
 });
 document.addEventListener('input', (e) => {
   if (e.target.id === 'ed') edHint();
-  if (e.target.id === 'ex-filter') {
+  if (e.target.id === 'ex-filter' || e.target.id === 'pick-filter') {
     const q = e.target.value.toLowerCase();
-    document.querySelectorAll('[data-name]').forEach((n) => { n.hidden = q && !n.dataset.name.includes(q); });
+    const scope = e.target.id === 'pick-filter' ? sheetEl : view;
+    scope.querySelectorAll('[data-name]').forEach((n) => { n.hidden = q && !n.dataset.name.includes(q); });
   }
 });
 fileInput.addEventListener('change', async () => {
@@ -839,6 +1002,8 @@ fileInput.addEventListener('change', async () => {
         Array.isArray(o.workouts) ? `${o.workouts.length} workouts (same IDs are replaced)` : '',
         o.coachTargets ? `coach targets for ${Object.keys(o.coachTargets).length} exercises` : '',
         o.program ? 'a program (replaces your current one)' : '', o.settings ? 'settings' : '',
+        Array.isArray(o.bodyweight) && o.bodyweight.length ? `${o.bodyweight.length} weigh-ins` : '',
+        o.customExercises ? `${Object.keys(o.customExercises).length} custom exercises` : '',
         o.hevyCsv ? 'Hevy history (you\'ll review it next)' : '',
       ].filter(Boolean);
       openSheet(`<h3>Import ${esc(f.name)}</h3><p>This file contains:</p><ul>${parts.map((p) => `<li>${esc(p)}</li>`).join('') || '<li>nothing recognizable</li>'}</ul>

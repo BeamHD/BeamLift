@@ -1,6 +1,6 @@
 // Beam Lift — export (JSON backup + CSV) and file sharing.
-import { APP_VERSION, KIND_LABEL } from './data.js';
-import { series, bests, fmt, maxPain, workSets } from './engine.js';
+import { APP_VERSION, KIND_LABEL, MUSCLES } from './data.js';
+import { series, bests, fmt, maxPain, workSets, balance, bwTrend } from './engine.js';
 
 // Full backup. `summary` is a compact per-exercise digest meant for Claude to read.
 export function buildBackup(S, getEx) {
@@ -17,11 +17,20 @@ export function buildBackup(S, getEx) {
     }));
     return { exercise: ex.name, id, unit: KIND_LABEL[ex.kind] || '', sessions: pts.length, last: pts[pts.length - 1].date.slice(0, 10), bestE1rm: Math.round(b.e1rm), heaviest: b.maxW, recent };
   }).filter(Boolean).sort((a, b) => (a.last < b.last ? 1 : -1));
+  const groups = Object.keys(MUSCLES);
+  const bal = balance(S.workouts, getEx, groups);
+  const muscleBalance = {
+    note: 'Sets per muscle group per Mon–Sun week (primary = 1, secondary = 0.5), oldest week first.',
+    weeks: bal.weeks.map((w) => ({ weekOf: new Date(w.from).toISOString().slice(0, 10), workouts: w.n, sets: Object.fromEntries(groups.map((g) => [g, w.sets[g] || 0])) })),
+    flagged: bal.flagged.map((f) => ({ muscle: f.g, why: f.why })),
+  };
+  const tr = bwTrend(S.bw || []);
+  const bodyweightSummary = tr.length ? { latest: tr[tr.length - 1].lb, avg7: Math.round(tr[tr.length - 1].avg * 10) / 10, entries: tr.length, goal: S.settings.bwGoal || null } : null;
   return {
     app: 'beamlift', schema: 1, version: APP_VERSION, exportedAt: new Date().toISOString(),
     notes: 'Weights in lb. db = per hand; bb = total incl. 45 bar; lm = plates added; time "reps" = seconds; carry "reps" = meters. e1RM = Epley.',
     settings: S.settings, program: S.program, state: S.state, coachTargets: S.coach, customExercises: S.custom,
-    summary, workouts: S.workouts,
+    summary, muscleBalance, bodyweightSummary, bodyweight: S.bw || [], workouts: S.workouts,
   };
 }
 

@@ -5,12 +5,14 @@ Workflow rule: batch clarifying questions + short plan + explicit OK before buil
 
 ## Stack
 Vanilla HTML/CSS/JS ES modules, no build step, no dependencies. Data on-device in IndexedDB.
-- `js/data.js` — exercise catalog (kinds, cues, swaps, Hevy name mapping), DEFAULT_PROGRAM, equipment defaults
+- `js/data.js` — exercise catalog (kinds, muscle/pattern/equipment tags, `rx` defaults, cues, swaps, Hevy name mapping),
+  MUSCLES/PATTERNS/METHODS, DEFAULT_PROGRAM (`phase.ramp` caps sets early in a phase), equipment defaults
 - `js/engine.js` — progression rules (`suggest`), Epley e1RM, PRs, plate math, rotation
 - `js/app.js` — all UI (hash routes, `data-act` click delegation, bottom sheets, rest timer, wake lock)
 - `js/hevy.js` — Hevy CSV import (halves two-dumbbell totals; landmine minus 45 lb bar)
 - `js/io.js` — JSON backup (with a per-exercise `summary` for Claude) and CSV export
 - `sw.js` — offline cache. **Bump `VERSION` in sw.js and `APP_VERSION` in data.js on every deploy.**
+  Pre-release: versions are 0.x (0.1 = first deploy). Don't call anything "v1" until Beam says it's a full release.
 
 ## Weight conventions
 db = per hand · db1 = single DB/KB · bb = total incl. 45 bar · lm = plates added (bar excluded) · bw = added load ·
