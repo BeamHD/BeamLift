@@ -4,8 +4,12 @@ import { APP_VERSION, DEFAULT_PROGRAM, DEFAULT_SETTINGS, EQUIPMENT, EXERCISES, K
 import * as E from './engine.js';
 import { readHevy, convertHevy, mapName, slug } from './hevy.js';
 import { buildBackup, buildCSV, shareOrDownload } from './io.js';
+import * as SY from './sync.js';
 
-const S = { settings: null, program: null, state: null, coach: {}, custom: {}, workouts: [], active: null, bw: [], prefs: { liked: [], disliked: [] }, idea: null };
+const S = {
+  settings: null, program: null, state: null, coach: {}, custom: {}, workouts: [], active: null, bw: [],
+  prefs: { liked: [], disliked: [] }, idea: null, sync: null, deleted: [], applied: [],
+};
 const GROUPS = Object.keys(MUSCLES);
 const UI = { pickDay: null, worse: { knee: false, shoulder: false, back: false }, short: false, edit: null, ci: null, hevy: null, json: null, gen: null, nxReturn: null };
 
@@ -77,6 +81,9 @@ async function load() {
   S.bw = ((await DB.get('bodyweight')) || []).sort(byDate);
   S.prefs = { liked: [], disliked: [], ...((await DB.get('prefs')) || {}) };
   S.idea = (await DB.get('idea')) || null;
+  S.sync = (await DB.get('sync')) || null;
+  S.deleted = (await DB.get('deleted')) || [];
+  S.applied = (await DB.get('applied')) || [];
   S.workouts = ((await DB.allWorkouts()) || []).sort(byStart);
   await migrate();
 }
@@ -102,6 +109,24 @@ async function migrate() {
     if (ex.custom && (ex.hevy || []).some((n) => mapName(n))) { delete S.custom[id]; c = true; }
   }
   if (c) await DB.set('custom', S.custom);
+}
+// Applies a Beam Lift JSON object (Settings → Import, or Claude's inbox.json via sync).
+async function importObject(o) {
+  if (Array.isArray(o.workouts) && o.workouts.length) {
+    await DB.putWorkouts(o.workouts);
+    const ids = new Set(o.workouts.map((w) => w.id));
+    S.workouts = [...S.workouts.filter((w) => !ids.has(w.id)), ...o.workouts].sort(byStart);
+  }
+  if (o.coachTargets) { S.coach = { ...S.coach, ...o.coachTargets }; await DB.set('coach', S.coach); }
+  if (o.customExercises) { S.custom = { ...S.custom, ...o.customExercises }; await DB.set('custom', S.custom); }
+  if (o.program && Array.isArray(o.program.phases)) { S.program = o.program; await DB.set('program', S.program); }
+  if (o.settings) { S.settings = { ...S.settings, ...o.settings }; await saveSettings(); }
+  if (o.state) { S.state = { ...S.state, ...o.state }; await DB.set('state', S.state); }
+  if (Array.isArray(o.bodyweight)) {
+    const m = new Map(S.bw.map((e) => [e.date, e]));
+    for (const e of o.bodyweight) if (e && e.date && e.lb > 0) m.set(e.date, { date: e.date, lb: +e.lb });
+    S.bw = [...m.values()].sort(byDate); await DB.set('bodyweight', S.bw);
+  }
 }
 const saveActive = () => (S.active ? DB.set('active', S.active) : DB.del('active'));
 const saveSettings = () => DB.set('settings', S.settings);
@@ -704,6 +729,134 @@ function chart(points, label) {
     ${points.some((p) => p.low) ? '<div class="muted small">Hollow dots: sets over 12 reps — rougher estimate.</div>' : ''}`;
 }
 
+// ---------- cloud sync ----------
+// Merge rules: workouts = union minus deletions (tombstones); weigh-ins, custom exercises and idea likes = union,
+// this phone wins on conflicts; settings/program/state are only taken from the cloud on a phone with no workouts
+// of its own (e.g. a new phone). Claude's inbox.json is applied once per id.
+const SYNC_ACTS = new Set(['finish', 'deleteW', 'bwSave', 'bwDel', 'bwGoal', 'nxSave', 'nxDel', 'ideaRate', 'ideaNever',
+  'saveProgram', 'resetProgram', 'saveEquip', 'setPhase', 'clearCoach', 'jsonImport', 'hevyImport', 'saveLink', 'setRest']);
+let syncTimer = null, syncing = null;
+function queueSync(ms = 3000) {
+  if (!S.sync || !S.sync.token) return;
+  clearTimeout(syncTimer);
+  syncTimer = setTimeout(() => syncNow(false), ms);
+}
+function syncFile() {
+  return { ...buildBackup(S, getEx), deletedWorkouts: S.deleted, appliedInbox: S.applied };
+}
+async function mergeRemote(r) {
+  let changed = false;
+  const tomb = new Set([...S.deleted, ...(r.deletedWorkouts || [])]);
+  const have = new Set(S.workouts.map((w) => w.id));
+  const add = (r.workouts || []).filter((w) => w && w.id && Array.isArray(w.exercises) && !have.has(w.id) && !tomb.has(w.id));
+  if (add.length) { await DB.putWorkouts(add); S.workouts.push(...add); changed = true; }
+  const gone = S.workouts.filter((w) => tomb.has(w.id));
+  for (const w of gone) await DB.delWorkout(w.id);
+  if (gone.length) { S.workouts = S.workouts.filter((w) => !tomb.has(w.id)); changed = true; }
+  S.workouts.sort(byStart);
+  S.deleted = [...tomb]; await DB.set('deleted', S.deleted);
+  if (Array.isArray(r.bodyweight)) {
+    const m = new Map(S.bw.map((e) => [e.date, e]));
+    for (const e of r.bodyweight) if (e && e.date && e.lb > 0 && !m.has(e.date)) { m.set(e.date, { date: e.date, lb: +e.lb }); changed = true; }
+    S.bw = [...m.values()].sort(byDate); await DB.set('bodyweight', S.bw);
+  }
+  if (r.customExercises) {
+    for (const [id, ex] of Object.entries(r.customExercises)) if (!S.custom[id]) { S.custom[id] = ex; changed = true; }
+    await DB.set('custom', S.custom);
+  }
+  if (r.ideas) {
+    S.prefs.liked = [...new Set([...S.prefs.liked, ...(r.ideas.liked || [])])];
+    S.prefs.disliked = [...new Set([...S.prefs.disliked, ...(r.ideas.disliked || [])])];
+    await DB.set('prefs', S.prefs);
+  }
+  S.applied = [...new Set([...S.applied, ...(r.appliedInbox || [])])]; await DB.set('applied', S.applied);
+  const fresh = !S.sync.lastSync && !S.workouts.some((w) => w.source === 'beamlift' && !add.includes(w));
+  if (fresh) {
+    if (r.settings) { S.settings = { ...S.settings, ...r.settings }; await saveSettings(); }
+    if (r.program && Array.isArray(r.program.phases)) { S.program = r.program; await DB.set('program', S.program); }
+    if (r.state) { S.state = { ...S.state, ...r.state }; await DB.set('state', S.state); }
+    if (r.coachTargets) { S.coach = { ...r.coachTargets, ...S.coach }; await DB.set('coach', S.coach); }
+    changed = true;
+  }
+  if (add.length) await migrate();
+  return changed;
+}
+async function applyInbox(o) {
+  if (!o || !o.id || S.applied.includes(o.id)) return false;
+  await importObject(o);
+  S.applied = [...S.applied, o.id]; await DB.set('applied', S.applied);
+  S.sync.lastInbox = { id: o.id, message: o.message || '', at: new Date().toISOString() };
+  toast(o.message ? `Coach update: ${o.message}` : 'Coach update received', 6000);
+  return true;
+}
+function syncNow(manual = false) {
+  const cfg = S.sync;
+  if (!cfg || !cfg.repo || !cfg.token) { if (manual) toast('Set up sync first'); return Promise.resolve(); }
+  if (syncing) return syncing;
+  if (!navigator.onLine) { if (manual) toast('Offline — it will sync when you\'re back online'); return Promise.resolve(); }
+  syncing = (async () => {
+    let changed = false;
+    try {
+      if (!cfg.checked) {
+        const info = await SY.repoInfo(cfg);
+        if (!info.private) throw new Error('That repo is public. Sync only works with a PRIVATE repo — your data stays private.');
+        cfg.checked = true;
+      }
+      const remote = await SY.readFile(cfg, SY.FILE);
+      if (remote) changed = (await mergeRemote(JSON.parse(remote.text))) || changed;
+      const inbox = await SY.readFile(cfg, SY.INBOX);
+      if (inbox) changed = (await applyInbox(JSON.parse(inbox.text))) || changed;
+      const msg = `Sync ${new Date().toISOString()}`;
+      try {
+        await SY.writeFile(cfg, SY.FILE, JSON.stringify(syncFile()), remote && remote.sha, msg);
+      } catch (e) {
+        if (e.status !== 409 && e.status !== 422) throw e;
+        const again = await SY.readFile(cfg, SY.FILE); // someone else wrote in between: merge and retry once
+        if (again) changed = (await mergeRemote(JSON.parse(again.text))) || changed;
+        await SY.writeFile(cfg, SY.FILE, JSON.stringify(syncFile()), again && again.sha, msg);
+      }
+      cfg.lastSync = new Date().toISOString(); cfg.lastError = null;
+      if (manual) toast('Synced ✓');
+    } catch (e) {
+      cfg.lastError = e.message || String(e);
+      if (manual) toast(`Sync failed: ${cfg.lastError}`, 6000);
+    }
+    await DB.set('sync', cfg);
+    syncing = null;
+    const r = route().name;
+    if ((changed || r === 'settings') && !['workout', 'newex', 'import'].includes(r) && !document.body.classList.contains('sheet-open')) render();
+  })();
+  return syncing;
+}
+function ago(iso) {
+  const s = (Date.now() - new Date(iso)) / 1000;
+  if (s < 60) return 'just now';
+  if (s < 3600) return `${Math.round(s / 60)} min ago`;
+  if (s < 86400) return `${Math.round(s / 3600)} h ago`;
+  return dateStr(iso, { month: 'short', day: 'numeric' });
+}
+function syncCard() {
+  const c = S.sync;
+  if (c && c.token) {
+    return `<div class="card"><div class="q">Cloud sync</div>
+      <div class="small">Private repo <b>${esc(c.repo)}</b> · ${c.lastSync ? `synced ${esc(ago(c.lastSync))}` : 'not synced yet'}</div>
+      ${c.lastError ? `<div class="flag small">${esc(c.lastError)}</div>` : ''}
+      ${c.lastInbox ? `<div class="muted small">Last coach update: ${esc(c.lastInbox.message || c.lastInbox.id)} (${esc(ago(c.lastInbox.at))})</div>` : ''}
+      <div class="row-btns"><button class="btn" data-act="syncNow">Sync now</button><button class="btn ghost" data-act="syncOff">Disconnect</button></div>
+      <div class="muted small">Syncs when the app opens and after each workout. The token stays on this phone and is never exported.</div></div>`;
+  }
+  return `<div class="card"><div class="q">Cloud sync</div>
+    <div class="muted small">Back up to a private GitHub repo automatically, and get coach updates from Claude.</div>
+    ${c && c.lastError ? `<div class="flag small">${esc(c.lastError)}</div>` : ''}
+    <details><summary>How to set it up (5 min)</summary><ol class="small steps">
+      <li>On github.com, create a new <b>private</b> repository (e.g. BeamLift-data). Tick "Add a README".</li>
+      <li>Go to Settings → Developer settings → Fine-grained tokens → Generate new token. Repository access: <b>Only select repositories</b> → that repo. Permissions → Repository → <b>Contents: Read and write</b>.</li>
+      <li>Copy the token, paste it below with the repo name, and tap Connect.</li></ol></details>
+    <label class="fld">Repository (owner/name)<input id="sy-repo" placeholder="owner/BeamLift-data" autocomplete="off" autocapitalize="off" value="${esc((c && c.repo) || '')}"></label>
+    <label class="fld">Token<input id="sy-token" type="password" autocomplete="off" placeholder="github_pat_…"></label>
+    <button class="btn primary wide" data-act="syncSave">Connect & sync</button></div>`;
+}
+
 VIEWS.settings = () => {
   const st = S.settings;
   const plates = Object.entries(st.plates).sort((a, b) => b[0] - a[0]).map(([p, c]) => `${p}×${c}`).join(', ');
@@ -713,7 +866,8 @@ VIEWS.settings = () => {
   <div class="card"><div class="q">Your data</div>
     <div class="row-btns"><button class="btn" data-act="exportJSON">Export backup (JSON)</button><button class="btn" data-act="exportCSV">Export CSV</button></div>
     <button class="btn ghost wide" data-act="importFile">Import: Hevy CSV or Beam Lift JSON</button>
-    <div class="muted small">${S.workouts.length} workouts stored on this phone. Back up after workouts until cloud sync lands.</div></div>
+    <div class="muted small">${S.workouts.length} workouts stored on this phone.${S.sync && S.sync.token ? '' : ' Back up after workouts, or set up cloud sync below.'}</div></div>
+  ${syncCard()}
   <div class="card"><div class="q">Program phase</div><div class="chips">${S.program.phases.map((p) => `<button class="chip ${p.id === S.state.phase ? 'on' : ''}" data-act="setPhase" data-v="${esc(p.id)}">${esc(p.name)}</button>`).join('')}</div>
     ${coach.length ? `<div class="q">Coach targets (used once, next time)</div>${coach.map(([id, t]) => `<div class="li"><div class="grow">${esc(getEx(id).name)}: ${esc(wLabel(getEx(id).kind, t.weight))}${t.reps ? ` × ${t.reps}` : ''}</div><button class="btn small ghost" data-act="clearCoach" data-v="${esc(id)}">Clear</button></div>`).join('')}` : ''}
     <details><summary>Edit program (JSON)</summary><textarea id="progjson" spellcheck="false">${esc(JSON.stringify(S.program, null, 2))}</textarea>
@@ -936,6 +1090,23 @@ const A = {
     else if (a > 50 && b >= a && b < 500) S.settings.bwGoal = [a, b];
     else { toast('Goal needs two numbers, low then high'); return; }
     await saveSettings(); toast('Goal saved'); render();
+  },
+  // cloud sync
+  syncSave: async () => {
+    const repo = document.getElementById('sy-repo').value.trim().replace(/^https?:\/\/github\.com\//i, '').replace(/\.git$/i, '').replace(/\/$/, '');
+    const token = document.getElementById('sy-token').value.trim();
+    if (!/^[\w.-]+\/[\w.-]+$/.test(repo)) { toast('Repository should look like owner/name'); return; }
+    if (!token) { toast('Paste the token from GitHub'); return; }
+    S.sync = { repo, token, lastSync: null, lastError: null, checked: false };
+    await DB.set('sync', S.sync);
+    render();
+    await syncNow(true);
+    if (S.sync && S.sync.lastError && !S.sync.lastSync) { S.sync = { repo, token: '', lastError: S.sync.lastError }; await DB.set('sync', S.sync); render(); toast(`Couldn't connect: ${S.sync.lastError}`, 7000); }
+  },
+  syncNow: () => syncNow(true),
+  syncOff: async () => {
+    if (!confirm('Disconnect cloud sync? Data on this phone and in the repo stays as it is.')) return;
+    S.sync = null; await DB.del('sync'); toast('Sync disconnected'); render();
   },
   // generator
   genAsk: () => openGenAsk(false),
@@ -1186,6 +1357,7 @@ const A = {
     if (!confirm('Delete this workout permanently?')) return;
     await DB.delWorkout(el.dataset.v);
     S.workouts = S.workouts.filter((w) => w.id !== el.dataset.v);
+    S.deleted = [...new Set([...S.deleted, el.dataset.v])]; await DB.set('deleted', S.deleted);
     location.hash = '#history';
   },
   saveLink: async (el) => {
@@ -1221,21 +1393,7 @@ const A = {
   jsonImport: async () => {
     const o = UI.json;
     if (!o) return;
-    if (Array.isArray(o.workouts) && o.workouts.length) {
-      await DB.putWorkouts(o.workouts);
-      const ids = new Set(o.workouts.map((w) => w.id));
-      S.workouts = [...S.workouts.filter((w) => !ids.has(w.id)), ...o.workouts].sort(byStart);
-    }
-    if (o.coachTargets) { S.coach = { ...S.coach, ...o.coachTargets }; await DB.set('coach', S.coach); }
-    if (o.customExercises) { S.custom = { ...S.custom, ...o.customExercises }; await DB.set('custom', S.custom); }
-    if (o.program && Array.isArray(o.program.phases)) { S.program = o.program; await DB.set('program', S.program); }
-    if (o.settings) { S.settings = { ...S.settings, ...o.settings }; await saveSettings(); }
-    if (o.state) { S.state = { ...S.state, ...o.state }; await DB.set('state', S.state); }
-    if (Array.isArray(o.bodyweight)) {
-      const m = new Map(S.bw.map((e) => [e.date, e]));
-      for (const e of o.bodyweight) if (e && e.date && e.lb > 0) m.set(e.date, { date: e.date, lb: +e.lb });
-      S.bw = [...m.values()].sort(byDate); await DB.set('bodyweight', S.bw);
-    }
+    await importObject(o);
     UI.json = null; closeSheet();
     toast('Imported');
     if (o.hevyCsv) { UI.hevy = readHevy(o.hevyCsv); location.hash = '#import'; render(); } else { location.hash = '#history'; }
@@ -1283,7 +1441,8 @@ document.addEventListener('click', (e) => {
   const f = A[el.dataset.act];
   if (!f) return;
   e.preventDefault();
-  Promise.resolve(f(el, e)).catch((err) => { console.error(err); toast(`Something went wrong: ${err.message}`, 5000); });
+  Promise.resolve(f(el, e)).then(() => { if (SYNC_ACTS.has(el.dataset.act)) queueSync(); })
+    .catch((err) => { console.error(err); toast(`Something went wrong: ${err.message}`, 5000); });
 });
 document.addEventListener('change', (e) => {
   const el = e.target;
@@ -1330,7 +1489,9 @@ window.addEventListener('hashchange', () => {
 });
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible' && S.active) { keepAwake(); tick(); }
+  if (document.visibilityState === 'visible' && S.sync && (!S.sync.lastSync || Date.now() - new Date(S.sync.lastSync) > 10 * 60000)) queueSync(2000);
 });
+window.addEventListener('online', () => { if (S.sync) queueSync(2000); });
 
 // ---------- boot ----------
 async function init() {
@@ -1339,6 +1500,7 @@ async function init() {
   if (S.active) { scheduleRest(); keepAwake(); }
   render();
   setInterval(tick, 500);
+  if (S.sync) queueSync(1500);
   const local = /^(localhost|127\.0\.0\.1)$/.test(location.hostname) && !location.search.includes('sw');
   if ('serviceWorker' in navigator && !local) {
     const had = !!navigator.serviceWorker.controller;

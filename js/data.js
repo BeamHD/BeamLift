@@ -16,7 +16,7 @@
 //   idea        one line used when the exercise is suggested as a new idea
 //   rehab       only picked by the generator when a joint feels off
 
-export const APP_VERSION = '0.2.1';
+export const APP_VERSION = '0.2.2';
 
 export const DEFAULT_SETTINGS = {
   restDefault: 90,

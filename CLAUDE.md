@@ -25,6 +25,12 @@ Preview config `beamlift` (.claude/launch.json → tools/serve.ps1, port 8765). 
 GitHub Pages from `main` / root → https://beamhd.github.io/BeamLift/ . Public repo: NEVER commit personal data.
 `private/` (Hevy CSV, seed/import files, backups) is gitignored.
 
+## Cloud sync (0.2.2+)
+`js/sync.js` syncs to a PRIVATE GitHub repo via the contents API (token stays on the phone; public repos are refused).
+- `beamlift.json` — written by the app: full backup (same shape as Export) + `deletedWorkouts`, `appliedInbox`.
+- `inbox.json` — written by Claude: an import object with a unique `id` (+ optional `message`); applied once per id.
+Clone the data repo into `private/data/` (gitignored) to read it; push a new `inbox.json` to send coach updates.
+
 ## Reviewing progress / adjusting the program
 Beam exports a JSON backup (Settings → Export) and drops it in `private/`. Read `summary` first, then `workouts`.
 To push changes back: write a JSON file with any of `coachTargets` ({exId: {weight, reps, note}} — used once, next time),
