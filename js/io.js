@@ -30,7 +30,9 @@ export function buildBackup(S, getEx) {
     app: 'beamlift', schema: 1, version: APP_VERSION, exportedAt: new Date().toISOString(),
     notes: 'Weights in lb. db = per hand; bb = total incl. 45 bar; lm = plates added; time "reps" = seconds; carry "reps" = meters. e1RM = Epley.',
     settings: S.settings, program: S.program, state: S.state, coachTargets: S.coach, customExercises: S.custom,
-    summary, muscleBalance, bodyweightSummary, bodyweight: S.bw || [], workouts: S.workouts,
+    summary, muscleBalance, bodyweightSummary, bodyweight: S.bw || [],
+    ideas: { liked: (S.prefs || {}).liked || [], disliked: (S.prefs || {}).disliked || [], current: S.idea || null },
+    workouts: S.workouts,
   };
 }
 

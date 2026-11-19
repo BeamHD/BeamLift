@@ -101,7 +101,7 @@ export function suggest(item, ex, ctx) {
   const ct = ctx.coach && ctx.coach[item.ex];
   if (ct) return out(ct.weight, ct.reps ?? lo, 'coach', ct.note || 'Coach target');
 
-  const last = lastEntry(item.ex, ctx.workouts);
+  const last = lastPlain(item.ex, ctx.workouts);
   if (!last) {
     if (!wt) return out(item.start, lo, 'start', `Bodyweight — aim for ${lo}${kind === 'time' ? ' s' : ' reps'} at an easy-moderate effort`);
     return out(item.start, lo, 'start', item.start != null ? 'Starting weight — adjust after set 1 if it feels off' : 'First time — pick a comfortable start');
@@ -337,6 +337,137 @@ export function balance(workouts, getEx, groups, now = Date.now()) {
     }
   }
   return { week: weeks[3].sets, weeks, recent, nRecent, flagged, med };
+}
+
+// ---------- workout generator ----------
+// pool: { id: ex } (catalog + tagged custom). ctx: { flagged: [muscle], recent: Set(id), liked: Set, disliked: Set,
+// joints: [joint] (avoid loading these), rand: () => number }.
+const PULLS = ['hpull', 'vpull'], PUSHES = ['hpush', 'apush'], LEGS = ['squat', 'lunge'];
+export const REASONS = {
+  bored: { label: 'Bored', title: 'remix', hint: 'New accessories — main lifts stay so they keep progressing' },
+  short: { label: 'Short on time', title: 'short', hint: 'Main lifts kept, extras paired into supersets' },
+  joint: { label: 'Joint feels off', title: 'joint-friendly', hint: 'Swaps out anything that loads it' },
+  low: { label: 'Low energy', title: 'easy day', hint: 'Fewer sets — showing up still counts' },
+  surprise: { label: 'Surprise me', title: 'surprise', hint: 'Built around what is behind this week' },
+};
+
+function usable(id, ex, c, avoid) {
+  if (!ex || !ex.pat || avoid.has(id) || c.disliked.has(id)) return false;
+  if (ex.rehab && !(c.joints || []).length) return false;
+  if ((c.joints || []).some((j) => (ex.joints || []).includes(j))) return false;
+  return true;
+}
+function score(id, ex, c) {
+  const flag = (ex.prim || []).filter((m) => c.flagged.includes(m)).length;
+  return flag * 3 + (c.liked.has(id) ? 1.5 : 0) - (c.recent.has(id) ? 2.5 : 0) + c.rand() * 1.5;
+}
+// Best exercise for a slot. slot: { pats: [], prim: [] }. Falls back to same primary muscle, then any pattern match.
+export function pickFor(slot, pool, c, avoid = new Set()) {
+  const ok = Object.entries(pool).filter(([id, ex]) => usable(id, ex, c, avoid));
+  const tiers = [
+    ok.filter(([, ex]) => slot.pats.includes(ex.pat) && (!slot.prim || !slot.prim.length || (ex.prim || []).some((m) => slot.prim.includes(m)))),
+    ok.filter(([, ex]) => slot.pats.includes(ex.pat)),
+    ok.filter(([, ex]) => slot.prim && (ex.prim || []).some((m) => slot.prim.includes(m))),
+  ];
+  for (const t of tiers) {
+    if (!t.length) continue;
+    return t.map(([id, ex]) => ({ id, ex, s: score(id, ex, c) })).sort((a, b) => b.s - a.s)[0].id;
+  }
+  return null;
+}
+function itemFor(id, ex, base = {}) {
+  const rx = ex.rx || [2, 8, 12];
+  return { ex: id, sets: base.sets || rx[0], reps: [rx[1], rx[2]], start: ex.start, rest: ex.rest, main: !!base.main };
+}
+const slotOf = (it, ex) => ({ pats: [ex.pat], prim: ex.prim || [] });
+
+// Pair exercises that don't compete (push + pull, legs + core/arms) into supersets, keeping pairs adjacent.
+export function pairUp(items, pool) {
+  const pat = (it) => (pool[it.ex] || {}).pat;
+  const left = items.map((it) => ({ ...it, ss: null }));
+  const out = [];
+  let letter = 0;
+  const take = (pred, from) => { const k = left.findIndex((x, j) => j !== from && pred(x)); return k; };
+  while (left.length) {
+    const a = left.shift();
+    let k = -1;
+    if (PUSHES.includes(pat(a))) k = take((x) => PULLS.includes(pat(x)), -1);
+    else if (PULLS.includes(pat(a))) k = take((x) => PUSHES.includes(pat(x)), -1);
+    else if (LEGS.includes(pat(a)) || pat(a) === 'hip') k = take((x) => ['core', 'iso', 'carry'].includes(pat(x)), -1);
+    else k = take((x) => !LEGS.includes(pat(x)) && pat(x) !== 'hip', -1);
+    if (k < 0 && !a.main) k = take(() => true, -1);
+    if (k >= 0) {
+      const b = left.splice(k, 1)[0];
+      const id = String.fromCharCode(97 + letter++);
+      out.push({ ...a, ss: id }, { ...b, ss: id });
+    } else out.push(a);
+  }
+  return out;
+}
+
+// Build a workout. base = the planned day's items.
+export function generate(reason, base, pool, c) {
+  const exOf = (it) => pool[it.ex] || {};
+  const used = new Set(reason === 'bored' ? base.filter((it) => it.main).map((it) => it.ex) : []);
+  const mainSets = Math.max(0, ...base.filter((it) => it.main).map((it) => it.sets)) || 3;
+  const accSets = Math.min(2, mainSets);
+  let items;
+  if (reason === 'surprise') {
+    const slots = [
+      { pats: LEGS, main: true }, { pats: PUSHES, main: true }, { pats: PULLS, main: true },
+      { pats: ['hip'] }, { pats: ['iso', 'carry', 'core', ...LEGS, ...PUSHES, ...PULLS], prim: c.flagged.length ? c.flagged : null, gap: true },
+      { pats: ['core'] },
+    ];
+    items = slots.map((sl) => {
+      const id = pickFor(sl, pool, c, used);
+      if (!id) return null;
+      used.add(id);
+      return { ...itemFor(id, pool[id], { main: sl.main, sets: sl.main ? mainSets : accSets }), why: sl.gap && c.flagged.length ? 'for what is behind' : '' };
+    }).filter(Boolean);
+  } else {
+    items = base.map((it) => {
+      const ex = exOf(it);
+      if (reason === 'low') return { ...it, sets: Math.max(1, it.main ? it.sets - 1 : 1) };
+      if (reason === 'short' || (reason === 'bored' && it.main)) return { ...it };
+      const loads = (c.joints || []).some((j) => (ex.joints || []).includes(j));
+      if (reason === 'joint' && !loads) { used.add(it.ex); return { ...it }; }
+      const id = pickFor(slotOf(it, ex), pool, c, new Set([...used, it.ex]));
+      if (!id) return reason === 'joint' ? null : { ...it };
+      used.add(id);
+      return { ...itemFor(id, pool[id], it), why: reason === 'joint' ? `instead of ${ex.name || it.ex}` : '' };
+    }).filter(Boolean);
+    if (reason === 'low') {
+      const acc = items.map((it, k) => (!it.main ? k : -1)).filter((k) => k >= 0);
+      if (acc.length > 1) items.splice(acc[acc.length - 1], 1);
+    }
+    if (reason === 'joint' && c.joints.includes('knee') && !items.some((it) => it.ex === 'straight-leg-raise') && pool['straight-leg-raise']) {
+      items.push({ ...itemFor('straight-leg-raise', pool['straight-leg-raise']), why: 'gentle knee work' });
+    }
+    if (reason === 'short') {
+      const extra = items.filter((it) => !it.main);
+      const keep = items.filter((it) => it.main).concat(extra.slice(0, 2).map((it) => ({ ...it, sets: Math.min(it.sets, 2) })));
+      items = pairUp(keep, pool);
+    }
+  }
+  return items;
+}
+
+// Swap one item for something else that trains the same thing (keeps sets, main flag and superset).
+export function reroll(item, list, pool, c) {
+  const ex = pool[item.ex] || {};
+  const avoid = new Set(list.map((x) => x.ex));
+  const id = pickFor({ pats: ex.pat ? [ex.pat] : [], prim: ex.prim || [] }, pool, c, avoid);
+  if (!id) return null;
+  return { ...itemFor(id, pool[id], item), ss: item.ss || null, why: '' };
+}
+
+// Most recent entry for an exercise that wasn't done with a special method (tempo, pauses…), for progression.
+export function lastPlain(exId, workouts) {
+  for (let i = workouts.length - 1; i >= 0; i--) {
+    const e = workouts[i].exercises.find((x) => x.exId === exId && !x.method && (workSets(x).length || x.stopped));
+    if (e) return { w: workouts[i], e };
+  }
+  return lastEntry(exId, workouts);
 }
 
 // ---------- bodyweight ----------

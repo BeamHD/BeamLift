@@ -1,5 +1,5 @@
 // Beam Lift service worker — offline app shell. Bump VERSION on every deploy.
-const VERSION = 'beamlift-0.2.0';
+const VERSION = 'beamlift-0.2.1';
 const ASSETS = [
   './', './index.html', './manifest.webmanifest', './css/app.css',
   './js/app.js', './js/db.js', './js/data.js', './js/engine.js', './js/hevy.js', './js/io.js',

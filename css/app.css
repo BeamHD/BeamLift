@@ -197,6 +197,25 @@ details summary { min-height: 44px; display: flex; align-items: center; color: v
 .chart .goal-t { fill: #7ee2a0; }
 .chart circle.raw { fill: var(--muted); }
 
+/* 0.2.1: generator, ideas, supersets, own exercises */
+.toggle.half { width: auto; flex: 1; }
+.row .btn.small { flex: none; }
+.banner.gen { align-items: center; }
+.banner.gen .btn { flex: none; }
+.btn.reason { flex-direction: column; align-items: flex-start; justify-content: center; gap: 2px; min-height: 60px; text-align: left; padding: 8px 14px; }
+.btn.reason span { font-weight: 400; }
+.li-tools { display: flex; gap: 6px; }
+.icon.sm { width: 38px; height: 38px; font-size: 16px; }
+.card.idea { border-color: #6b5012; background: linear-gradient(180deg, #1d1a10, var(--card)); }
+.card.idea b { font-size: 17px; }
+.card.idea .row-btns .btn { flex: 1 1 auto; }
+.ss-tag { display: inline-block; background: #2e1f5e; color: #c4b5fd; border-radius: 6px; padding: 1px 6px; font-size: 12px; font-weight: 700; margin-right: 6px; vertical-align: 2px; }
+.ex.ss { border-left: 4px solid #8b5cf6; }
+.ss-line { font-size: 12px; color: #c4b5fd; margin: -2px 0 6px; }
+.cue.method { color: #ffd27a; background: #2a2210; }
+textarea.short { min-height: 80px; font: inherit; font-size: 15px; }
+.inline input { min-width: 0; }
+
 #toast { position: fixed; left: 16px; right: 16px; top: calc(12px + env(safe-area-inset-top, 0px)); z-index: 60; max-width: 520px; margin: 0 auto;
   background: #222831; border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; text-align: center; box-shadow: 0 8px 24px rgba(0, 0, 0, .5); }
 #toast[hidden] { display: none; }

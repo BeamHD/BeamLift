@@ -16,7 +16,7 @@
 //   idea        one line used when the exercise is suggested as a new idea
 //   rehab       only picked by the generator when a joint feels off
 
-export const APP_VERSION = '0.2.0';
+export const APP_VERSION = '0.2.1';
 
 export const DEFAULT_SETTINGS = {
   restDefault: 90,
@@ -26,6 +26,7 @@ export const DEFAULT_SETTINGS = {
   bar: 45,
   videoLinks: {},
   bwGoal: null, // [low, high] lb, set in the app
+  ssSwitch: 15, // seconds to move between the two exercises of a superset
 };
 
 export const KIND_LABEL = {

@@ -1,13 +1,13 @@
 // Beam Lift — UI. Vanilla JS, hash routes, one delegated click handler (data-act).
 import * as DB from './db.js';
-import { APP_VERSION, DEFAULT_PROGRAM, DEFAULT_SETTINGS, EXERCISES, KIND_LABEL, MUSCLES } from './data.js';
+import { APP_VERSION, DEFAULT_PROGRAM, DEFAULT_SETTINGS, EQUIPMENT, EXERCISES, KIND_LABEL, METHODS, MUSCLES, PATTERNS } from './data.js';
 import * as E from './engine.js';
-import { readHevy, convertHevy, mapName } from './hevy.js';
+import { readHevy, convertHevy, mapName, slug } from './hevy.js';
 import { buildBackup, buildCSV, shareOrDownload } from './io.js';
 
-const S = { settings: null, program: null, state: null, coach: {}, custom: {}, workouts: [], active: null, bw: [] };
+const S = { settings: null, program: null, state: null, coach: {}, custom: {}, workouts: [], active: null, bw: [], prefs: { liked: [], disliked: [] }, idea: null };
 const GROUPS = Object.keys(MUSCLES);
-const UI = { pickDay: null, worse: { knee: false, shoulder: false, back: false }, short: false, edit: null, ci: null, hevy: null, json: null };
+const UI = { pickDay: null, worse: { knee: false, shoulder: false, back: false }, short: false, edit: null, ci: null, hevy: null, json: null, gen: null, nxReturn: null };
 
 const view = document.getElementById('view');
 const dock = document.getElementById('dock');
@@ -75,6 +75,8 @@ async function load() {
   S.custom = (await DB.get('custom')) || {};
   S.active = (await DB.get('active')) || null;
   S.bw = ((await DB.get('bodyweight')) || []).sort(byDate);
+  S.prefs = { liked: [], disliked: [], ...((await DB.get('prefs')) || {}) };
+  S.idea = (await DB.get('idea')) || null;
   S.workouts = ((await DB.allWorkouts()) || []).sort(byStart);
   await migrate();
 }
@@ -184,7 +186,7 @@ function route() {
   const i = h.indexOf('/');
   return i < 0 ? { name: h, arg: null } : { name: h.slice(0, i), arg: decodeURIComponent(h.slice(i + 1)) };
 }
-const TAB = { today: 'today', workout: 'today', summary: 'today', history: 'history', w: 'history', progress: 'progress', ex: 'progress', balance: 'progress', bw: 'progress', settings: 'settings', import: 'settings' };
+const TAB = { today: 'today', workout: 'today', summary: 'today', history: 'history', w: 'history', progress: 'progress', ex: 'progress', balance: 'progress', bw: 'progress', settings: 'settings', import: 'settings', newex: 'settings' };
 const VIEWS = {};
 function render() {
   const r = route();
@@ -202,7 +204,7 @@ function renderDock(name) {
     dock.innerHTML = r ? `<div class="rest">
       <div class="rest-fill" id="rest-fill"></div>
       <button class="rbtn" data-act="restAdj" data-d="-15">−15</button>
-      <button class="rest-mid" data-act="restSkip"><span class="rest-label">Rest · tap to skip</span><span class="rest-time" id="rest-time">${mmss(Math.ceil((r.end - Date.now()) / 1000))}</span></button>
+      <button class="rest-mid" data-act="restSkip"><span class="rest-label">${esc(r.label && r.label.startsWith('Switch') ? r.label : 'Rest')} · tap to skip</span><span class="rest-time" id="rest-time">${mmss(Math.ceil((r.end - Date.now()) / 1000))}</span></button>
       <button class="rbtn" data-act="restAdj" data-d="15">+15</button></div>` : '';
     document.body.classList.toggle('has-rest', !!r);
   } else {
@@ -239,7 +241,33 @@ function makeEntry(it, c) {
     rest: restFor(it.ex, it.rest), range: [...it.reps], note: it.note || '', sug: { ...sug, weight },
     prev: last ? E.workSets(last.e).map((s) => ({ weight: s.weight, reps: s.reps })) : [],
     prevDate: last ? last.w.start : null, sets, effort: null, pain: null, stopped: null,
+    ss: it.ss || null, method: it.method || null,
   };
+}
+// Catalog + your own/tagged exercises — what the generator can choose from.
+function pool() {
+  const p = { ...EXERCISES };
+  for (const [id, ex] of Object.entries(S.custom)) if (ex.pat && ex.prim && ex.prim.length) p[id] = ex;
+  return p;
+}
+function genCtx(joints = []) {
+  const b = E.balance(S.workouts, getEx, GROUPS);
+  const recent = new Set(S.workouts.slice(-2).flatMap((w) => w.exercises.map((e) => e.exId)));
+  return { flagged: b.flagged.map((f) => f.g), recent, liked: new Set(S.prefs.liked), disliked: new Set(S.prefs.disliked), joints, rand: Math.random };
+}
+// "A1", "A2"… for exercises paired into a superset.
+function ssLabel(list, i) {
+  const en = list[i];
+  if (!en || !en.ss) return '';
+  const order = [...new Set(list.filter((x) => x.ss).map((x) => x.ss))];
+  return `${String.fromCharCode(65 + order.indexOf(en.ss))}${list.slice(0, i + 1).filter((x) => x.ss === en.ss).length}`;
+}
+const ssTag = (list, i) => { const l = ssLabel(list, i); return l ? `<span class="ss-tag">${l}</span>` : ''; };
+function methodFits(m, ex) {
+  if (m.eq && !(ex.eq || []).includes(m.eq)) return false;
+  if (m.kinds && !m.kinds.includes(ex.kind)) return false;
+  if (m.pats && !m.pats.includes(ex.pat)) return false;
+  return true;
 }
 function defaultItem(id) {
   const found = E.findItem(S.program, id, S.state.phase);
@@ -249,16 +277,27 @@ function defaultItem(id) {
   const k = ex.kind;
   return { ex: id, sets: 2, reps: k === 'time' ? [20, 30] : k === 'carry' ? [30, 30] : [8, 12] };
 }
+// The exercise to do next. Inside a superset, alternate: whichever partner has done fewer sets goes next.
 function currentIdx() {
   if (!S.active) return -1;
-  return S.active.exercises.findIndex((en) => !en.stopped && en.sets.some((s) => !s.done));
+  const list = S.active.exercises;
+  const open = (en) => !en.stopped && en.sets.some((s) => !s.done);
+  const i = list.findIndex(open);
+  if (i < 0 || !list[i].ss) return i;
+  const done = (k) => list[k].sets.filter((s) => s.done).length;
+  const members = list.map((_, k) => k).filter((k) => list[k].ss === list[i].ss && open(list[k]));
+  return members.reduce((best, k) => (done(k) < done(best) ? k : best), members[0]);
 }
 function exercisePicker(act, i) {
   const known = Object.entries(EXERCISES).map(([id, ex]) => ({ id, name: ex.name }));
-  const custom = Object.entries(S.custom).map(([id, ex]) => ({ id, name: ex.name }));
+  const mine = Object.entries(S.custom).filter(([, ex]) => ex.mine).map(([id, ex]) => ({ id, name: ex.name }));
+  const custom = Object.entries(S.custom).filter(([, ex]) => !ex.mine).map(([id, ex]) => ({ id, name: ex.name }));
   const btn = (e) => `<button class="li-btn" data-act="${act}" data-i="${i ?? ''}" data-v="${esc(e.id)}" data-name="${esc(e.name.toLowerCase())}">${esc(e.name)}</button>`;
-  return `<input class="search" id="pick-filter" placeholder="Search exercises…" autocomplete="off"><div class="picker">${known.sort((a, b) => a.name.localeCompare(b.name)).map(btn).join('')}
-    ${custom.length ? `<div class="q">From your Hevy history</div>${custom.sort((a, b) => a.name.localeCompare(b.name)).map(btn).join('')}` : ''}</div>`;
+  const az = (a, b) => a.name.localeCompare(b.name);
+  return `<input class="search" id="pick-filter" placeholder="Search exercises…" autocomplete="off">
+    <button class="btn ghost wide" data-act="nxFromPicker" data-for="${act}" data-i="${i ?? ''}">+ Create your own exercise</button>
+    <div class="picker">${mine.length ? `<div class="q">Your exercises</div>${mine.sort(az).map(btn).join('')}<div class="q">Library</div>` : ''}${known.sort(az).map(btn).join('')}
+    ${custom.length ? `<div class="q">From your Hevy history</div>${custom.sort(az).map(btn).join('')}` : ''}</div>`;
 }
 
 // ---------- views ----------
@@ -269,14 +308,16 @@ VIEWS.today = () => {
   const day = phase.days[dayKey];
   const c = ctx({ worse: UI.worse });
   const ramp = E.rampInfo(phase, nd.done);
-  const items = E.applyRamp(shortItems(day.items, UI.short), ramp);
+  const gen = UI.gen && UI.gen.dayKey === dayKey ? UI.gen : null;
+  const items = gen ? gen.items : E.applyRamp(shortItems(day.items, UI.short), ramp);
+  const title = gen ? genTitle(gen, day) : day.name;
   const wk = E.weekCount(S.workouts), stk = E.streak(S.workouts);
   const nextPhase = S.program.phases[S.program.phases.indexOf(phase) + 1];
   const hadOwn = S.workouts.some((w) => w.source !== 'hevy');
   const lastBw = S.bw[S.bw.length - 1];
   const weighIn = !lastBw || Date.now() - new Date(`${lastBw.date}T12:00:00`) > 7 * E.DAY;
   let h = `<div class="today-head">
-    <div><div class="muted">${dateStr(new Date())}</div><h1>${esc(day.name)}</h1>
+    <div><div class="muted">${dateStr(new Date())}</div><h1>${esc(title)}</h1>
     <div class="muted small">${esc(phase.name)} · session ${Math.min(nd.done + 1, phase.sessions)} of ${phase.sessions}</div>
     ${ramp ? `<div class="ramp small">Ramp-up: up to ${ramp.sets} sets per exercise · ${ramp.left} session${ramp.left === 1 ? '' : 's'} left</div>` : ''}</div>
     <div class="week"><b>${wk}/3</b><span>this week</span>${stk ? `<span>🔥 ${stk} wk streak</span>` : ''}
@@ -291,22 +332,111 @@ VIEWS.today = () => {
       ${['knee', 'shoulder', 'back'].map((j) => `<button class="chip ${UI.worse[j] ? 'on bad' : ''}" data-act="worse" data-v="${j}">${j[0].toUpperCase() + j.slice(1)}</button>`).join('')}
       <span class="muted small">${Object.values(UI.worse).some(Boolean) ? 'Related lifts back off ~15%' : 'Leave blank if all good'}</span></div></div>`;
   }
-  if (!S.active) {
-    h += `<button class="toggle ${UI.short ? 'on' : ''}" data-act="short"><span class="sw"></span>30-min version <span class="muted small">(main lifts keep all sets)</span></button>`;
+  if (!S.active && gen && gen.reason !== 'plan') {
+    const r = E.REASONS[gen.reason];
+    h += `<div class="banner gen"><div class="grow small">${esc(r ? r.hint : '')}. Tap ↻ on any exercise to swap just that one.</div>
+      <button class="btn small" data-act="genAgain">↻ Again</button><button class="btn small ghost" data-act="genClear">Back to plan</button></div>`;
+  } else if (!S.active) {
+    h += `<div class="row">${gen ? '<button class="btn small ghost" data-act="genClear">Back to plan</button>' : `<button class="toggle half ${UI.short ? 'on' : ''}" data-act="short"><span class="sw"></span>30-min version</button>`}
+      <button class="btn small" data-act="genAsk">↻ New workout</button></div>`;
   }
-  h += `<div class="card list">${items.map((it) => {
+  h += `<div class="card list">${items.map((it, k) => {
     const ex = getEx(it.ex);
     const s = E.suggest(it, ex, c);
     const w = s.weight ?? it.start;
-    return `<div class="li"><div class="grow"><b>${esc(ex.name)}</b>
+    const m = it.method && METHODS[it.method];
+    return `<div class="li"><div class="grow"><b>${ssTag(items, k)}${esc(ex.name)}</b>
       <div class="muted small">${rangeText(it.sets, it.reps, ex.kind, ex.perSide)} · ${esc(wLabel(ex.kind, w))}${s.reps !== it.reps[0] ? ` · aim ${s.reps}` : ''}</div>
+      ${it.why ? `<div class="note coach">${esc(it.why)}</div>` : ''}${m ? `<div class="note coach">🧪 ${esc(m.name)}: ${esc(m.text)}</div>` : ''}
       <div class="note ${s.decision}">${esc(s.note)}</div></div>
-      <a class="icon" href="${esc(howUrl(ex))}" target="_blank" rel="noopener" aria-label="How-to video">▶</a></div>`;
+      ${gen && !S.active ? `<div class="li-tools"><button class="icon sm" data-act="genReroll" data-k="${k}" aria-label="Swap this exercise">↻</button><button class="icon sm" data-act="genDrop" data-k="${k}" aria-label="Remove">✕</button></div>` : ''}
+      <a class="icon ${gen && !S.active ? 'sm' : ''}" href="${esc(howUrl(ex))}" target="_blank" rel="noopener" aria-label="How-to video">▶</a></div>`;
   }).join('')}</div>`;
+  if (!S.active) h += ideaCard();
   h += balanceCard();
-  if (!S.active) h += `<div class="cta"><button class="btn primary big" data-act="start" data-v="${esc(dayKey)}">Start ${esc(day.name)}</button></div>`;
+  if (!S.active) h += `<div class="cta"><button class="btn primary big" data-act="start" data-v="${esc(dayKey)}">Start ${esc(title)}</button></div>`;
   return h;
 };
+
+// ---------- generator ----------
+function genTitle(gen, day) {
+  if (gen.reason === 'surprise') return 'Surprise session';
+  if (gen.reason === 'joint') return `${day.name} · ${gen.joints.join(' & ')}-friendly`;
+  const r = E.REASONS[gen.reason];
+  return r ? `${day.name} · ${r.title}` : day.name;
+}
+function todayBase() {
+  const nd = E.nextDay(S.program, S.state, S.workouts);
+  const dayKey = UI.pickDay && nd.phase.days[UI.pickDay] ? UI.pickDay : nd.day;
+  const ramp = E.rampInfo(nd.phase, nd.done);
+  return { dayKey, ramp, items: nd.phase.days[dayKey].items.map((i) => ({ ...i })) };
+}
+function genBuild(reason, joints = []) {
+  const b = todayBase();
+  const items = E.applyRamp(E.generate(reason, b.items, pool(), genCtx(joints)), b.ramp);
+  UI.gen = { reason, joints, dayKey: b.dayKey, items };
+  UI.short = false;
+}
+function ensureGen() {
+  const b = todayBase();
+  if (!UI.gen || UI.gen.dayKey !== b.dayKey) UI.gen = { reason: 'plan', joints: [], dayKey: b.dayKey, items: E.applyRamp(shortItems(b.items, UI.short), b.ramp) };
+  return UI.gen;
+}
+function openGenAsk(joint) {
+  if (joint) {
+    UI.genJoints = UI.genJoints || [];
+    openSheet(`<h3>Which joint?</h3><div class="muted small">Anything that loads it gets swapped out.</div>
+      <div class="chips">${['knee', 'shoulder', 'back'].map((j) => `<button class="chip ${UI.genJoints.includes(j) ? 'on bad' : ''}" data-act="genJoint" data-v="${j}">${j[0].toUpperCase() + j.slice(1)}</button>`).join('')}</div>
+      <button class="btn primary big" data-act="genGo" data-v="joint" ${UI.genJoints.length ? '' : 'disabled'}>Build workout</button>
+      <div class="muted small">Sharp pain, giving way or slipping = skip that joint's lifts today and get it checked if it keeps happening.</div>`);
+    return;
+  }
+  openSheet(`<h3>New workout</h3><div class="muted small">What's going on today?</div>
+    ${Object.entries(E.REASONS).map(([k, r]) => `<button class="btn wide reason" data-act="${k === 'joint' ? 'genJointAsk' : 'genGo'}" data-v="${k}"><b>${esc(r.label)}</b><span class="muted small">${esc(r.hint)}</span></button>`).join('')}
+    <button class="btn ghost wide" data-act="closeSheet">Cancel</button>`);
+}
+
+// ---------- idea of the week ----------
+function currentIdea() {
+  const mon = E.mondayOf(Date.now());
+  if (S.idea && S.idea.week === mon) return S.idea;
+  const seen = new Set((S.idea && S.idea.seen) || []);
+  const tried = new Set(S.workouts.flatMap((w) => w.exercises.map((e) => e.exId)));
+  const dis = new Set(S.prefs.disliked);
+  const flagged = E.balance(S.workouts, getEx, GROUPS).flagged.map((f) => f.g);
+  const nd = E.nextDay(S.program, S.state, S.workouts);
+  const ramp = !!E.rampInfo(nd.phase, nd.done);
+  const exC = Object.entries(EXERCISES).filter(([id, ex]) => ex.idea && !tried.has(id) && !seen.has(id) && !dis.has(id))
+    .map(([id, ex]) => ({ id, ex, hit: (ex.prim || []).filter((m) => flagged.includes(m)), r: Math.random() }))
+    .sort((a, b) => b.hit.length - a.hit.length || b.r - a.r);
+  const mC = Object.entries(METHODS).filter(([id, m]) => (!ramp || m.ramp) && !seen.has(`m:${id}`) && !dis.has(`m:${id}`));
+  const odd = Math.round(mon / (7 * E.DAY)) % 2 === 1;
+  let pick = null;
+  const best = exC[0];
+  if (best && (best.hit.length || !odd || !mC.length)) {
+    pick = { type: 'exercise', id: best.id, why: best.hit.length ? `${best.hit.map((g) => MUSCLES[g]).join(' & ')} ${best.hit.length > 1 ? 'are' : 'is'} behind lately` : '' };
+  } else if (mC.length) {
+    const [id] = mC[Math.floor(Math.random() * mC.length)];
+    pick = { type: 'method', id, why: 'Same exercise, new challenge — goes on one accessory' };
+  }
+  if (!pick) return null;
+  S.idea = { week: mon, ...pick, status: 'new', seen: [...seen, pick.type === 'method' ? `m:${pick.id}` : pick.id] };
+  DB.set('idea', S.idea);
+  return S.idea;
+}
+const ideaKey = (idea) => (idea.type === 'method' ? `m:${idea.id}` : idea.id);
+const ideaName = (idea) => (idea.type === 'method' ? (METHODS[idea.id] || {}).name : getEx(idea.id).name) || idea.id;
+function ideaCard() {
+  const idea = currentIdea();
+  if (!idea || idea.status !== 'new') return '';
+  const isEx = idea.type === 'exercise';
+  const text = isEx ? getEx(idea.id).idea : (METHODS[idea.id] || {}).text;
+  return `<div class="card idea"><div class="q">💡 Idea of the week</div><b>${esc(ideaName(idea))}</b>
+    <div class="small">${esc(text || '')}</div>${idea.why ? `<div class="note coach">${esc(idea.why)}</div>` : ''}
+    <div class="row-btns"><button class="btn small primary" data-act="ideaAdd">Add to today</button>
+    ${isEx ? `<a class="btn small ghost" href="${esc(howUrl(getEx(idea.id)))}" target="_blank" rel="noopener">▶ How</a>` : ''}
+    <button class="btn small ghost" data-act="ideaSkip">Not now</button><button class="btn small ghost" data-act="ideaNever">Never</button></div></div>`;
+}
 
 // ---------- muscle balance ----------
 function muscleBars(sets, flagged = []) {
@@ -399,14 +529,16 @@ VIEWS.workout = () => {
   let h = `<div class="wo-head"><div><h1>${esc(w.title)}</h1>
     <div class="muted"><span id="elapsed">0:00</span> · ${done}/${total} sets</div></div>
     <button class="icon" data-act="woMenu" aria-label="Workout options">⋯</button></div>`;
-  w.exercises.forEach((en, i) => { h += exCard(en, i, i === cur); });
+  w.exercises.forEach((en, i) => { h += exCard(en, i, i === cur, w.exercises); });
   h += '<button class="btn ghost wide" data-act="addEx">+ Add exercise</button>';
   h += '<button class="btn primary big" data-act="finishAsk">Finish workout</button>';
   return h;
 };
 
-function exCard(en, i, isCur) {
+function exCard(en, i, isCur, list) {
   const ex = getEx(en.exId);
+  const m = en.method && METHODS[en.method];
+  const partners = en.ss ? list.filter((x, k) => k !== i && x.ss === en.ss).map((x) => x.name) : [];
   const unit = { db: 'LB', db1: 'LB', bb: 'LB', kb: 'LB', carry: 'LB', lm: 'PLATES', bw: 'ADDED', time: '' }[en.kind] ?? 'LB';
   const repsHead = en.kind === 'time' ? 'SEC' : en.kind === 'carry' ? 'M' : 'REPS';
   const normal = en.sets.filter((s) => s.type !== 'warmup').length;
@@ -427,14 +559,16 @@ function exCard(en, i, isCur) {
   const nextSet = en.sets.find((s) => !s.done && s.type !== 'warmup') || en.sets[0];
   const plates = nextSet && (en.kind === 'bb' || en.kind === 'lm') ? E.plateMath(en.kind, nextSet.weight, S.settings) : '';
   const allDone = en.sets.length && en.sets.every((s) => s.done);
-  return `<section class="card ex ${isCur ? 'cur' : ''} ${allDone ? 'complete' : ''} ${en.stopped ? 'stopped' : ''}" id="ex-${i}">
-    <div class="ex-head"><div class="grow"><h2>${esc(en.name)}</h2>
+  return `<section class="card ex ${isCur ? 'cur' : ''} ${allDone ? 'complete' : ''} ${en.stopped ? 'stopped' : ''} ${en.ss ? 'ss' : ''}" id="ex-${i}">
+    ${partners.length ? `<div class="ss-line">Superset with ${esc(partners.join(', '))} — alternate sets</div>` : ''}
+    <div class="ex-head"><div class="grow"><h2>${ssTag(list, i)}${esc(en.name)}</h2>
       <div class="muted small">${rangeText(normal, en.range, en.kind, en.perSide)} · ${esc(KIND_LABEL[en.kind] || '')} · rest ${mmss(en.rest)}</div></div>
       <a class="icon" href="${esc(howUrl(ex))}" target="_blank" rel="noopener" aria-label="How-to video">▶</a>
       <button class="icon" data-act="exMenu" data-i="${i}" aria-label="Exercise options">⋯</button></div>
     ${en.stopped
       ? `<div class="flag">🛑 Stopped: ${esc(en.stopped)}. Next time this backs off ~20%${ex.swap ? ` — or swap to ${esc(ex.swap)}` : ''}. If it keeps happening, get it checked.</div>`
       : `<div class="note ${en.sug.decision}">${esc(en.sug.note)}</div>`}
+    ${m ? `<div class="cue method">🧪 ${esc(m.name)}: ${esc(m.text)}</div>` : ''}
     ${isCur && ex.cue ? `<div class="cue">${esc(ex.cue)}</div>` : ''}
     ${en.note ? `<div class="cue">${esc(en.note)}</div>` : ''}
     ${plates ? `<div class="plates">${esc(plates)}</div>` : ''}
@@ -469,6 +603,12 @@ VIEWS.summary = (id) => {
     const wkSets = inWeek.reduce((a, x) => a + x.exercises.reduce((s, en) => s + E.workSets(en).length, 0), 0);
     recap = `<div class="card"><div class="q">📅 Week recap · ${inWeek.length} workouts · ${wkSets} sets</div>${flagLine(b)}${muscleBars(E.muscleSets(inWeek, getEx, mon, mon + 7 * E.DAY), b.flagged)}</div>`;
   }
+  const idea = S.idea;
+  if (idea && idea.status === 'added' && w.exercises.some((en) => (idea.type === 'method' ? en.method === idea.id : en.exId === idea.id) && E.workSets(en).length)) {
+    recap = `<div class="card idea"><div class="q">💡 Keep ${esc(ideaName(idea))} in your rotation?</div>
+      <div class="muted small">👍 = the generator picks it more often. 👎 = it never comes back.</div>
+      <div class="row-btns"><button class="btn" data-act="ideaRate" data-v="up">👍 Keep it</button><button class="btn ghost" data-act="ideaRate" data-v="down">👎 Not for me</button></div></div>${recap}`;
+  }
   return `<h1>Workout done 💪</h1>
     <div class="tiles"><div class="tile"><b>${mins ?? '–'}</b><span>min</span></div><div class="tile"><b>${sets}</b><span>sets</span></div><div class="tile"><b>${E.workoutVolume(w).toLocaleString()}</b><span>lb volume</span></div></div>
     ${prs.length ? `<div class="card"><div class="q">🏆 Personal records</div>${prs.map((p) => `<div class="pr"><b>${esc(p.ex)}</b> — ${esc(p.what)} ${esc(p.val)}</div>`).join('')}</div>` : ''}
@@ -498,7 +638,8 @@ VIEWS.w = (id) => {
   if (!w) return VIEWS.history();
   return `<a class="back" href="#history">‹ History</a><h1>${esc(w.title)}</h1>
     <div class="muted">${dateStr(w.start, { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' })}${w.short ? ' · 30-min version' : ''}</div>
-    ${w.exercises.map((en) => `<div class="card"><a class="ex-link" href="#ex/${encodeURIComponent(en.exId)}"><b>${esc(en.name)}</b></a>
+    ${w.exercises.map((en, i) => `<div class="card"><a class="ex-link" href="#ex/${encodeURIComponent(en.exId)}"><b>${ssTag(w.exercises, i)}${esc(en.name)}</b></a>
+      ${en.method && METHODS[en.method] ? `<div class="muted small">🧪 ${esc(METHODS[en.method].name)}</div>` : ''}
       <div class="small">${en.sets.map((s) => `<span class="pill ${s.type === 'warmup' ? 'warm' : ''}">${esc(E.formatSet(s, en.kind, en.perSide))}</span>`).join(' ')}</div>
       ${en.effort || en.pain ? `<div class="muted small">Effort ${en.effort ?? '–'} · knee ${en.pain?.knee ?? 0} · shoulder ${en.pain?.shoulder ?? 0} · back ${en.pain?.back ?? 0}</div>` : ''}
       ${en.stopped ? `<div class="flag">Stopped: ${esc(en.stopped)}</div>` : ''}
@@ -577,12 +718,14 @@ VIEWS.settings = () => {
     ${coach.length ? `<div class="q">Coach targets (used once, next time)</div>${coach.map(([id, t]) => `<div class="li"><div class="grow">${esc(getEx(id).name)}: ${esc(wLabel(getEx(id).kind, t.weight))}${t.reps ? ` × ${t.reps}` : ''}</div><button class="btn small ghost" data-act="clearCoach" data-v="${esc(id)}">Clear</button></div>`).join('')}` : ''}
     <details><summary>Edit program (JSON)</summary><textarea id="progjson" spellcheck="false">${esc(JSON.stringify(S.program, null, 2))}</textarea>
     <div class="row-btns"><button class="btn" data-act="saveProgram">Save program</button><button class="btn ghost" data-act="resetProgram">Reset to default</button></div></details></div>
+  ${myExercisesCard()}
   <div class="card"><div class="q">Equipment</div>
     <label class="fld">Dumbbell settings (lb)<input id="dbw" value="${esc(st.dbWeights.join(', '))}"></label>
     <label class="fld">Kettlebells (lb)<input id="kbw" value="${esc(st.kbWeights.join(', '))}"></label>
     <label class="fld">Plates you own (weight×count)<input id="plates" value="${esc(plates)}"></label>
     <label class="fld">Bar (lb)<input id="bar" inputmode="decimal" value="${esc(st.bar)}"></label>
     <label class="fld">Default rest (seconds)<input id="restd" inputmode="numeric" value="${esc(st.restDefault)}"></label>
+    <label class="fld">Superset switch time (seconds, 0 = none)<input id="ssw" inputmode="numeric" value="${esc(st.ssSwitch ?? 15)}"></label>
     <button class="btn wide" data-act="saveEquip">Save equipment</button></div>
   <div class="card"><div class="q">Rest alerts</div>
     <div class="muted small">The screen stays awake during workouts so the timer and vibration are reliable. Notifications when the phone is locked are best-effort. Status: ${esc(perm)}.</div>
@@ -591,6 +734,39 @@ VIEWS.settings = () => {
   <div class="card"><div class="q">About</div><div class="muted small">Beam Lift ${APP_VERSION}. Dumbbells logged per hand; barbell = total incl. bar; landmine = plates added. e1RM = Epley (w × (1 + reps/30)).</div></div>
   <button class="btn danger wide" data-act="wipe">Delete all data on this phone</button>`;
 };
+
+const KIND_CHOICES = { db: 'Dumbbells (per hand)', db1: 'One DB / KB', kb: 'Kettlebell', bb: 'Barbell', lm: 'Landmine', bw: 'Bodyweight / TRX', time: 'Timed hold', carry: 'Carry' };
+VIEWS.newex = (id) => {
+  const ex = (id && S.custom[id]) || {};
+  const editing = !!(id && S.custom[id]);
+  const chips = (g, opts, sel, multi) => `<div class="chips">${Object.entries(opts).map(([k, l]) => `<button class="chip ${[].concat(sel || []).includes(k) ? 'on' : ''}" data-act="nxChip" data-g="${g}" data-multi="${multi ? 1 : ''}" data-v="${k}">${esc(l)}</button>`).join('')}</div>`;
+  const rx = ex.rx || [2, 8, 12];
+  return `<button class="back linkbtn" data-act="goBack">‹ Back</button><h1>${editing ? 'Edit exercise' : 'New exercise'}</h1>
+    <div class="muted small">Tagged exercises show up in ↻ New workout and count toward muscle balance.</div>
+    <label class="fld">Name<input id="nx-name" value="${esc(ex.name || '')}" placeholder="e.g. TRX hamstring runner" autocomplete="off"></label>
+    <div class="q">How is it loaded?</div>${chips('kind', KIND_CHOICES, ex.kind || 'bw')}
+    <div class="q">Main muscles</div>${chips('prim', MUSCLES, ex.prim, true)}
+    <div class="q">Helper muscles <span class="muted small">(optional)</span></div>${chips('sec', MUSCLES, ex.sec, true)}
+    <div class="q">Movement</div>${chips('pat', PATTERNS, ex.pat)}
+    <div class="q">Equipment</div>${chips('eq', EQUIPMENT, ex.eq, true)}
+    <div class="q">Joints it loads <span class="muted small">(pain there triggers back-offs)</span></div>${chips('joints', { knee: 'Knee', shoulder: 'Shoulder', back: 'Back' }, ex.joints, true)}
+    ${chips('side', { side: 'Done one side at a time' }, ex.perSide ? ['side'] : [], true)}
+    <div class="q">Default sets · low reps · high reps <span class="muted small">(seconds for holds, meters for carries)</span></div>
+    <div class="inline"><input id="nx-sets" inputmode="numeric" value="${rx[0]}" aria-label="Sets"><input id="nx-lo" inputmode="numeric" value="${rx[1]}" aria-label="Low reps"><input id="nx-hi" inputmode="numeric" value="${rx[2]}" aria-label="High reps"></div>
+    <label class="fld">Form cue<textarea id="nx-cue" class="short" placeholder="What to feel, what to avoid">${esc(ex.cue || '')}</textarea></label>
+    <label class="fld">Video link (optional)<input id="nx-link" type="url" value="${esc((S.settings.videoLinks || {})[id] || '')}" placeholder="https://"></label>
+    <button class="btn primary big" data-act="nxSave" data-v="${esc(editing ? id : '')}">Save exercise</button>
+    ${editing && ex.mine ? `<button class="btn danger wide" data-act="nxDel" data-v="${esc(id)}">Delete exercise</button>` : ''}`;
+};
+
+function myExercisesCard() {
+  const mine = Object.entries(S.custom).filter(([, e]) => e.mine);
+  const hevyC = Object.entries(S.custom).filter(([, e]) => !e.mine);
+  const row = ([id, e], right) => `<a class="li link" href="#newex/${encodeURIComponent(id)}"><div class="grow">${esc(e.name)}${e.prim && e.prim.length ? `<div class="muted small">${esc(e.prim.map((m) => MUSCLES[m]).join(', '))}</div>` : ''}</div><span class="muted small">${right}</span></a>`;
+  return `<div class="card"><div class="row"><div class="q">My exercises</div><a class="btn small" href="#newex">+ New</a></div>
+    ${mine.length ? mine.map((x) => row(x, '›')).join('') : '<div class="muted small">Add moves you learn — they join ↻ New workout and the muscle balance.</div>'}
+    ${hevyC.length ? `<details><summary>From Hevy (${hevyC.length}) — tag one to use it in ↻</summary>${hevyC.map((x) => row(x, x[1].pat ? 'tagged' : 'untagged')).join('')}</details>` : ''}</div>`;
+}
 
 VIEWS.import = () => {
   const p = UI.hevy;
@@ -612,12 +788,15 @@ async function startWorkout(dayKey) {
   const ramp = E.rampInfo(phase, nd.done);
   const now = new Date();
   const c = ctx({ worse: UI.worse });
+  const gen = UI.gen && UI.gen.dayKey === dayKey ? UI.gen : null;
+  const items = gen ? gen.items : E.applyRamp(shortItems(day.items, UI.short), ramp);
   S.active = {
-    id: `w-${now.toISOString()}`, title: day.name, phase: phase.id, day: dayKey, source: 'beamlift',
-    start: now.toISOString(), end: null, short: UI.short, ramp: !!ramp, checkin: { worse: { ...UI.worse } }, rest: null,
-    exercises: E.applyRamp(shortItems(day.items, UI.short), ramp).map((it) => makeEntry(it, c)),
+    id: `w-${now.toISOString()}`, title: gen ? genTitle(gen, day) : day.name, phase: phase.id, day: dayKey, source: 'beamlift',
+    start: now.toISOString(), end: null, short: UI.short || (gen && gen.reason === 'short'), ramp: !!ramp, gen: gen ? gen.reason : null,
+    checkin: { worse: { ...UI.worse } }, rest: null,
+    exercises: items.map((it) => makeEntry(it, c)),
   };
-  UI.pickDay = null; UI.worse = { knee: false, shoulder: false, back: false }; UI.short = false;
+  UI.pickDay = null; UI.worse = { knee: false, shoulder: false, back: false }; UI.short = false; UI.gen = null;
   await saveActive();
   keepAwake();
   location.hash = '#workout';
@@ -630,11 +809,22 @@ function toggleDone(i, j) {
   if (s.done) {
     if (s.reps == null) s.reps = en.range[0];
     buzz(30); unlockAudio(); keepAwake();
+    const list = S.active.exercises;
     const moreHere = en.sets.some((x) => !x.done);
-    const moreAnywhere = S.active.exercises.some((x) => !x.stopped && x.sets.some((y) => !y.done));
-    if (moreAnywhere) startRest(s.type === 'warmup' ? 45 : en.rest, `Next: ${moreHere ? en.name : (S.active.exercises[currentIdx()] || {}).name || ''}`);
-    else { S.active.rest = null; clearTimeout(restTimeout); }
+    const moreAnywhere = list.some((x) => !x.stopped && x.sets.some((y) => !y.done));
+    const nx = currentIdx();
+    const doneOf = (k) => list[k].sets.filter((y) => y.done).length;
+    // Superset: go straight to the partner (short switch), full rest only after the round.
+    const switching = en.ss && nx >= 0 && nx !== i && list[nx].ss === en.ss && doneOf(nx) < doneOf(i);
+    if (moreAnywhere && switching) {
+      const sw = S.settings.ssSwitch ?? 15;
+      if (sw > 0) startRest(sw, `Switch → ${list[nx].name}`); else { S.active.rest = null; clearTimeout(restTimeout); }
+    } else if (moreAnywhere) {
+      const pairRest = en.ss ? Math.max(...list.filter((x) => x.ss === en.ss).map((x) => x.rest)) : en.rest;
+      startRest(s.type === 'warmup' ? 45 : pairRest, `Next: ${(list[nx] || en).name}`);
+    } else { S.active.rest = null; clearTimeout(restTimeout); }
     if (!moreHere && en.effort == null) openCheckin(i);
+    else if (switching) setTimeout(() => document.getElementById(`ex-${nx}`)?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 60);
   }
   saveActive(); render();
 }
@@ -708,6 +898,8 @@ function openExMenu(i) {
     <div class="row-btns"><a class="btn ghost" href="${esc(howUrl(ex))}" target="_blank" rel="noopener">▶ Video</a><a class="btn ghost" href="${esc(gifUrl(ex))}" target="_blank" rel="noopener">GIF</a>${my ? `<a class="btn ghost" href="${esc(my)}" target="_blank" rel="noopener">★ My link</a>` : ''}</div>
     <div class="q">Rest between sets <span class="muted small">(remembered for this exercise)</span></div>
     <div class="chips">${[60, 90, 120, 150, 180].map((v) => `<button class="chip ${en.rest === v ? 'on' : ''}" data-act="setRest" data-i="${i}" data-v="${v}">${mmss(v)}</button>`).join('')}</div>
+    ${i < S.active.exercises.length - 1 && !(en.ss && S.active.exercises[i + 1].ss === en.ss) ? `<button class="btn ghost wide" data-act="ssLink" data-i="${i}">⛓ Superset with next: ${esc(S.active.exercises[i + 1].name)}</button>` : ''}
+    ${en.ss ? `<button class="btn ghost wide" data-act="ssUnlink" data-i="${i}">Unlink superset</button>` : ''}
     <button class="btn ghost wide" data-act="removeSet" data-i="${i}">− Remove last unfinished set</button>
     <button class="btn ghost wide" data-act="swapAsk" data-i="${i}">⇄ Swap exercise${ex.swap ? ` <span class="muted small">(try: ${esc(ex.swap)})</span>` : ''}</button>
     <button class="btn ghost wide" data-act="removeEx" data-i="${i}">✕ Remove from this workout</button>
@@ -744,6 +936,120 @@ const A = {
     else if (a > 50 && b >= a && b < 500) S.settings.bwGoal = [a, b];
     else { toast('Goal needs two numbers, low then high'); return; }
     await saveSettings(); toast('Goal saved'); render();
+  },
+  // generator
+  genAsk: () => openGenAsk(false),
+  genJointAsk: () => openGenAsk(true),
+  genJoint: (el) => {
+    const j = el.dataset.v;
+    UI.genJoints = UI.genJoints.includes(j) ? UI.genJoints.filter((x) => x !== j) : [...UI.genJoints, j];
+    openGenAsk(true);
+  },
+  genGo: (el) => {
+    const reason = el.dataset.v;
+    genBuild(reason, reason === 'joint' ? [...UI.genJoints] : []);
+    UI.genJoints = [];
+    closeSheet(); render(); window.scrollTo(0, 0);
+  },
+  genAgain: () => { genBuild(UI.gen.reason, UI.gen.joints); render(); },
+  genClear: () => { UI.gen = null; render(); },
+  genReroll: (el) => {
+    const g = UI.gen, k = +el.dataset.k;
+    const r = E.reroll(g.items[k], g.items, pool(), genCtx(g.joints));
+    if (!r) { toast('No other option for that one'); return; }
+    const ramp = todayBase().ramp;
+    g.items[k] = E.applyRamp([r], ramp)[0];
+    render();
+  },
+  genDrop: (el) => {
+    const g = UI.gen, k = +el.dataset.k;
+    const [gone] = g.items.splice(k, 1);
+    if (gone && gone.ss) { const left = g.items.filter((x) => x.ss === gone.ss); if (left.length === 1) left[0].ss = null; }
+    render();
+  },
+  // idea of the week
+  ideaAdd: async () => {
+    const idea = S.idea;
+    const g = ensureGen();
+    if (idea.type === 'exercise') {
+      if (!g.items.some((it) => it.ex === idea.id)) g.items.push({ ...E.applyRamp([defaultItem(idea.id)], todayBase().ramp)[0], why: 'Idea of the week' });
+    } else {
+      const m = METHODS[idea.id];
+      const target = g.items.find((it) => !it.main && !it.method && methodFits(m, getEx(it.ex)))
+        || g.items.find((it) => !it.method && methodFits(m, getEx(it.ex)));
+      if (!target) { toast('Nothing in today\'s workout fits this method — it\'ll stay here for next time'); return; }
+      target.method = idea.id;
+    }
+    idea.status = 'added'; await DB.set('idea', idea);
+    toast('Added to today'); render();
+  },
+  ideaSkip: async () => { S.idea.status = 'skipped'; await DB.set('idea', S.idea); render(); },
+  ideaNever: async () => {
+    S.prefs.disliked = [...new Set([...S.prefs.disliked, ideaKey(S.idea)])];
+    S.idea.status = 'skipped';
+    await DB.set('prefs', S.prefs); await DB.set('idea', S.idea);
+    toast('Got it — won\'t suggest that again'); render();
+  },
+  ideaRate: async (el) => {
+    const k = ideaKey(S.idea);
+    if (el.dataset.v === 'up') S.prefs.liked = [...new Set([...S.prefs.liked, k])];
+    else S.prefs.disliked = [...new Set([...S.prefs.disliked, k])];
+    S.idea.status = 'rated';
+    await DB.set('prefs', S.prefs); await DB.set('idea', S.idea);
+    toast(el.dataset.v === 'up' ? 'Added to your rotation' : 'Noted — it won\'t come back'); render();
+  },
+  // supersets
+  ssLink: (el) => {
+    const i = +el.dataset.i, list = S.active.exercises;
+    const used = new Set(list.map((x) => x.ss).filter(Boolean));
+    let id = list[i].ss || list[i + 1].ss;
+    for (let c = 0; !id; c++) { const l = String.fromCharCode(97 + c); if (!used.has(l)) id = l; }
+    list[i].ss = id; list[i + 1].ss = id;
+    closeSheet(); saveActive(); render();
+  },
+  ssUnlink: (el) => {
+    const list = S.active.exercises, en = list[+el.dataset.i], id = en.ss;
+    en.ss = null;
+    const left = list.filter((x) => x.ss === id);
+    if (left.length === 1) left[0].ss = null;
+    closeSheet(); saveActive(); render();
+  },
+  // your own exercises
+  nxFromPicker: (el) => { UI.nxReturn = { act: el.dataset.for, i: el.dataset.i }; closeSheet(); location.hash = '#newex'; },
+  nxChip: (el) => {
+    if (el.dataset.multi) el.classList.toggle('on');
+    else el.parentElement.querySelectorAll('.chip').forEach((c) => c.classList.toggle('on', c === el));
+  },
+  nxSave: async (el) => {
+    const pick = (g) => [...view.querySelectorAll(`.chip.on[data-g="${g}"]`)].map((c) => c.dataset.v);
+    const val = (id) => document.getElementById(id).value.trim();
+    const name = val('nx-name');
+    const kind = pick('kind')[0], prim = pick('prim'), pat = pick('pat')[0];
+    if (!name) { toast('Give it a name'); return; }
+    if (!kind || !prim.length || !pat) { toast('Pick how it\'s loaded, at least one main muscle, and a movement'); return; }
+    const num = (id, d) => { const n = parseInt(val(id), 10); return n > 0 ? n : d; };
+    const sets = Math.min(num('nx-sets', 2), 10), lo = num('nx-lo', 8), hi = Math.max(lo, num('nx-hi', 12));
+    const link = val('nx-link');
+    if (link && !/^https?:\/\//i.test(link)) { toast('Video link must start with https://'); return; }
+    let id = el.dataset.v;
+    if (!id) { const base = `c-${slug(name)}`; id = base; for (let n = 2; EXERCISES[id] || S.custom[id]; n++) id = `${base}-${n}`; }
+    const prev = S.custom[id] || {};
+    S.custom[id] = {
+      ...prev, name, kind, perSide: pick('side').length > 0, prim, sec: pick('sec').filter((m) => !prim.includes(m)), pat,
+      eq: pick('eq'), joints: pick('joints'), rx: [sets, lo, hi], cue: val('nx-cue'), how: prev.how || `${name} form`,
+      custom: true, mine: prev.hevy ? !!prev.mine : true,
+    };
+    S.settings.videoLinks = { ...(S.settings.videoLinks || {}) };
+    if (link) S.settings.videoLinks[id] = link; else delete S.settings.videoLinks[id];
+    await DB.set('custom', S.custom); await saveSettings();
+    toast(`Saved ${name}`);
+    const r = UI.nxReturn; UI.nxReturn = null;
+    if (r && S.active && A[r.act]) { location.hash = '#workout'; setTimeout(() => A[r.act]({ dataset: { v: id, i: r.i } }), 50); } else location.hash = '#settings';
+  },
+  nxDel: async (el) => {
+    if (!confirm('Delete this exercise? Past workouts that used it keep their sets.')) return;
+    delete S.custom[el.dataset.v];
+    await DB.set('custom', S.custom); location.hash = '#settings';
   },
   resume: () => { location.hash = '#workout'; },
   pickDay: (el) => { UI.pickDay = el.dataset.v; render(); },
@@ -956,8 +1262,9 @@ const A = {
     }
     const db = nums('dbw'), kb = nums('kbw');
     const bar = parseFloat(document.getElementById('bar').value), rest = parseInt(document.getElementById('restd').value, 10);
-    if (!db.length || !Object.keys(plates).length || !(bar > 0) || !(rest > 0)) { toast('Check the equipment fields'); return; }
-    Object.assign(S.settings, { dbWeights: db, kbWeights: kb, plates, bar, restDefault: rest });
+    const ssw = parseInt(document.getElementById('ssw').value, 10);
+    if (!db.length || !Object.keys(plates).length || !(bar > 0) || !(rest > 0) || !(ssw >= 0)) { toast('Check the equipment fields'); return; }
+    Object.assign(S.settings, { dbWeights: db, kbWeights: kb, plates, bar, restDefault: rest, ssSwitch: ssw });
     await saveSettings(); toast('Equipment saved'); render();
   },
   notify: async () => { try { await Notification.requestPermission(); } catch { /* ignore */ } render(); },
